@@ -1,0 +1,134 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Import JetBrains Mono for terminal aesthetic */
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+
+/* Base styles */
+:root {
+  --terminal-bg: #0a0a0a;
+  --terminal-card: #141414;
+  --terminal-border: #2a2a2a;
+  --terminal-text: #e5e5e5;
+  --terminal-muted: #737373;
+
+  --neon-green: #00ff88;
+  --neon-red: #ff4444;
+  --neon-blue: #00d4ff;
+  --neon-purple: #a855f7;
+  --neon-gold: #ffd700;
+}
+
+body {
+  @apply bg-terminal-bg text-terminal-text;
+  font-family: 'Inter', system-ui, sans-serif;
+}
+
+/* Terminal aesthetic for numbers and data */
+.font-mono {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+/* Custom scrollbar for terminal feel */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--terminal-bg);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--terminal-border);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--terminal-muted);
+}
+
+/* Neon glow effects */
+.glow-green {
+  box-shadow: 0 0 10px var(--neon-green),
+              0 0 20px var(--neon-green),
+              0 0 30px var(--neon-green);
+}
+
+.glow-red {
+  box-shadow: 0 0 10px var(--neon-red),
+              0 0 20px var(--neon-red);
+}
+
+.glow-gold {
+  box-shadow: 0 0 10px var(--neon-gold),
+              0 0 20px var(--neon-gold),
+              0 0 30px var(--neon-gold);
+}
+
+/* Text glow */
+.text-glow-green {
+  text-shadow: 0 0 10px var(--neon-green);
+}
+
+.text-glow-red {
+  text-shadow: 0 0 10px var(--neon-red);
+}
+
+/* Pulse animation for alerts */
+@keyframes alert-pulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.8;
+    transform: scale(1.02);
+  }
+}
+
+.alert-pulse {
+  animation: alert-pulse 1s ease-in-out infinite;
+}
+
+/* Grid lines background for terminal feel */
+.terminal-grid {
+  background-image:
+    linear-gradient(var(--terminal-border) 1px, transparent 1px),
+    linear-gradient(90deg, var(--terminal-border) 1px, transparent 1px);
+  background-size: 20px 20px;
+  background-position: -1px -1px;
+}
+
+/* Scanline effect (subtle) */
+.scanlines::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: linear-gradient(
+    to bottom,
+    transparent 50%,
+    rgba(0, 0, 0, 0.1) 50%
+  );
+  background-size: 100% 4px;
+  pointer-events: none;
+  opacity: 0.3;
+}
+
+/* Grade badge glow animation */
+@keyframes grade-glow {
+  0%, 100% {
+    box-shadow: 0 0 5px currentColor;
+  }
+  50% {
+    box-shadow: 0 0 15px currentColor, 0 0 25px currentColor;
+  }
+}
+
+.grade-glow {
+  animation: grade-glow 2s ease-in-out infinite;
+}
