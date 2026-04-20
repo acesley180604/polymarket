@@ -1,0 +1,25 @@
+# secrets
+*.env
+*.env.*
+polymarket.env*
+
+# data / state (large, runtime-generated)
+*.jsonl
+*.log
+*.db
+arb_state.json
+hypotheses.json
+delta_signals.jsonl
+brier_log.jsonl
+calibration_stats.json
+starting_bankroll.json
+truth_cache.json
+tg_chat_ids.json
+
+# backups
+*.bak*
+.cleanup-backup-*/
+
+# python
+__pycache__/
+*.pyc
