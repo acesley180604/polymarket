@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Polymarket Dashboard</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg:       #1a1a2e;
+    --bg2:      #16213e;
+    --bg3:      #0f3460;
+    --card:     #1e2a45;
+    --border:   #2a3a5c;
+    --text:     #e0e6f0;
+    --muted:    #8899b4;
+    --green:    #00d4a0;
+    --red:      #ff4f6d;
+    --yellow:   #ffcc44;
+    --blue:     #4a90d9;
+    --accent:   #6c63ff;
+    --tab-h:    52px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; font-size: 14px; overflow-x: hidden; }
+
+  /* header */
+  .header { background: var(--bg2); padding: 12px 16px 8px; border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10; }
+  .header-row { display: flex; justify-content: space-between; align-items: center; }
+  .header h1 { font-size: 16px; font-weight: 700; color: var(--text); }
+  .freshness { font-size: 11px; padding: 2px 8px; border-radius: 10px; font-weight: 600; }
+  .fresh-live   { background: rgba(0,212,160,.15); color: var(--green); }
+  .fresh-aging  { background: rgba(255,204,68,.15); color: var(--yellow); }
+  .fresh-stale  { background: rgba(255,79,109,.15); color: var(--red); }
+
+  /* tabs */
+  .tabs { display: flex; background: var(--bg2); border-bottom: 1px solid var(--border); overflow-x: auto; scrollbar-width: none; }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tab { flex: 1; min-width: 60px; padding: 0 4px; height: var(--tab-h); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; font-size: 11px; transition: all .15s; white-space: nowrap; }
+  .tab .icon { font-size: 18px; }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  /* content */
+  .content { padding: 12px 12px 80px; }
+  .pane { display: none; }
+  .pane.active { display: block; }
+
+  /* cards */
+  .card-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
+  .card-grid.cols3 { grid-template-columns: 1fr 1fr 1fr; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+  .card .label { font-size: 11px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .5px; }
+  .card .value { font-size: 22px; font-weight: 700; }
+  .card .sub   { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .card.green  { border-color: rgba(0,212,160,.3); }
+  .card.red    { border-color: rgba(255,79,109,.3); }
+  .card.yellow { border-color: rgba(255,204,68,.3); }
+
+  /* section */
+  .section { margin-bottom: 16px; }
+  .section-title { font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+
+  /* list rows */
+  .row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--border); }
+  .row:last-child { border-bottom: none; }
+  .row .name  { color: var(--text); font-weight: 500; }
+  .row .meta  { font-size: 12px; color: var(--muted); margin-top: 1px; }
+  .row .right { text-align: right; }
+  .row .val   { font-weight: 600; }
+
+  /* badge */
+  .badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 8px; }
+  .badge.green  { background: rgba(0,212,160,.15); color: var(--green); }
+  .badge.red    { background: rgba(255,79,109,.15); color: var(--red); }
+  .badge.yellow { background: rgba(255,204,68,.15); color: var(--yellow); }
+  .badge.blue   { background: rgba(74,144,217,.15); color: var(--blue); }
+  .badge.muted  { background: rgba(136,153,180,.15); color: var(--muted); }
+
+  /* gate progress */
+  .gate-bar { background: var(--border); border-radius: 6px; height: 8px; margin: 6px 0; overflow: hidden; }
+  .gate-fill { height: 100%; border-radius: 6px; transition: width .5s; }
+  .gate-fill.green  { background: var(--green); }
+  .gate-fill.yellow { background: var(--yellow); }
+  .gate-fill.red    { background: var(--red); }
+  .gate-item { margin-bottom: 12px; }
+  .gate-row  { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 3px; }
+  .gate-check { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+
+  /* trade table */
+  .trade-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .trade-table th { color: var(--muted); font-weight: 600; text-align: left; padding: 6px 4px; border-bottom: 1px solid var(--border); font-size: 11px; text-transform: uppercase; }
+  .trade-table td { padding: 7px 4px; border-bottom: 1px solid rgba(42,58,92,.5); }
+  .trade-table tr:hover td { background: rgba(255,255,255,.02); }
+
+  /* scanner log */
+  .log-line { font-size: 11px; font-family: monospace; color: var(--muted); padding: 3px 0; border-bottom: 1px solid rgba(42,58,92,.3); }
+  .log-line.signal { color: var(--green); }
+  .log-line.idle   { color: var(--muted); }
+  .log-line.warn   { color: var(--yellow); }
+
+  /* system rows */
+  .sys-row { display: flex; justify-content: space-between; align-items: center; padding: 9px 0; border-bottom: 1px solid var(--border); }
+  .sys-row:last-child { border-bottom: none; }
+  .sys-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 8px; }
+  .dot-green  { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot-yellow { background: var(--yellow); }
+  .dot-red    { background: var(--red); }
+  .dot-grey   { background: var(--muted); }
+
+  /* spinner */
+  .spinner { text-align: center; padding: 40px; color: var(--muted); }
+
+  /* error */
+  .error-msg { background: rgba(255,79,109,.1); border: 1px solid rgba(255,79,109,.3); border-radius: 8px; padding: 12px; color: var(--red); font-size: 13px; margin: 12px 0; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-row">
+    <h1>⚡ Polymarket</h1>
+    <span class="freshness fresh-live" id="freshness">Loading…</span>
+  </div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('portfolio')" id="tab-portfolio">
+    <span class="icon">💼</span><span>Portfolio</span>
+  </div>
+  <div class="tab" onclick="switchTab('scanner')" id="tab-scanner">
+    <span class="icon">📡</span><span>Scanner</span>
+  </div>
+  <div class="tab" onclick="switchTab('trades')" id="tab-trades">
+    <span class="icon">📋</span><span>Trades</span>
+  </div>
+  <div class="tab" onclick="switchTab('gate')" id="tab-gate">
+    <span class="icon">🏆</span><span>Gate</span>
+  </div>
+  <div class="tab" onclick="switchTab('system')" id="tab-system">
+    <span class="icon">⚙️</span><span>System</span>
+  </div>
+</div>
+
+<div class="content">
+  <div class="pane active" id="pane-portfolio"><div class="spinner">Loading…</div></div>
+  <div class="pane" id="pane-scanner"><div class="spinner">Loading…</div></div>
+  <div class="pane" id="pane-trades"><div class="spinner">Loading…</div></div>
+  <div class="pane" id="pane-gate"><div class="spinner">Loading…</div></div>
+  <div class="pane" id="pane-system"><div class="spinner">Loading…</div></div>
+</div>
+
+<script>
+const tg = window.Telegram && window.Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+
+let _activeTab = 'portfolio';
+let _lastFetch = 0;
+let _data = null;
+let _refreshTimer = null;
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  document.getElementById('pane-' + name).classList.add('active');
+  _activeTab = name;
+  if (_data) render(_data);
+}
+
+// ── freshness indicator ────────────────────────────────────────────────────
+setInterval(function() {
+  const el = document.getElementById('freshness');
+  if (!_lastFetch) return;
+  const age = (Date.now() - _lastFetch) / 1000;
+  if (age < 20)      { el.textContent = `LIVE · ${age.toFixed(0)}s`; el.className = 'freshness fresh-live'; }
+  else if (age < 60) { el.textContent = `AGING · ${age.toFixed(0)}s`; el.className = 'freshness fresh-aging'; }
+  else               { el.textContent = `STALE · ${Math.floor(age/60)}m`; el.className = 'freshness fresh-stale'; }
+}, 1000);
+
+// ── fetch ──────────────────────────────────────────────────────────────────
+async function fetchData() {
+  try {
+    const r = await fetch('/api/data', {cache: 'no-store'});
+    const j = await r.json();
+    if (j.ok) {
+      _data = j.data;
+      _lastFetch = Date.now();
+      render(_data);
+    }
+  } catch(e) {
+    console.error('fetch err', e);
+  }
+}
+
+function startRefresh() {
+  if (_refreshTimer) clearInterval(_refreshTimer);
+  fetchData();
+  _refreshTimer = setInterval(fetchData, 10000);
+}
+startRefresh();
+
+// ── renderers ──────────────────────────────────────────────────────────────
+function render(d) {
+  renderPortfolio(d);
+  renderScanner(d);
+  renderTrades(d);
+  renderGate(d);
+  renderSystem(d);
+}
+
+function fmt(v, pre='$') {
+  if (v === null || v === undefined) return '<span style="color:var(--muted)">TBD</span>';
+  if (typeof v === 'number') return pre + v.toFixed(2);
+  return v;
+}
+function pct(v) {
+  if (v === null || v === undefined) return '<span style="color:var(--muted)">TBD</span>';
+  return (v*100).toFixed(1) + '%';
+}
+function badge(text, color) { return `<span class="badge ${color}">${text}</span>`; }
+function statusBadge(s) {
+  if (!s) return badge('?','muted');
+  const sl = s.toLowerCase();
+  if (sl === 'matched') return badge('FILLED','green');
+  if (sl === 'live')    return badge('OPEN','blue');
+  if (sl === 'win')     return badge('WIN','green');
+  if (sl === 'loss')    return badge('LOSS','red');
+  return badge(s.toUpperCase(),'muted');
+}
+
+function renderPortfolio(d) {
+  const p    = d.portfolio;
+  const perf = d.performance;
+  const wr   = perf.win_rate !== null ? pct(perf.win_rate) : '<span style="color:var(--muted)">TBD</span>';
+  const wrColor = perf.win_rate === null ? '' : perf.win_rate >= 0.65 ? 'green' : 'red';
+  document.getElementById('pane-portfolio').innerHTML = `
+    <div class="section">
+      <div class="section-title">Capital</div>
+      <div class="card-grid">
+        <div class="card ${p.cash > 2 ? 'green' : 'yellow'}">
+          <div class="label">Cash Available</div>
+          <div class="value" style="color:var(--${p.cash > 2 ? 'green':'yellow'})">${fmt(p.cash)}</div>
+          <div class="sub">Ready to deploy</div>
+        </div>
+        <div class="card">
+          <div class="label">Deployed</div>
+          <div class="value">${fmt(p.deployed)}</div>
+          <div class="sub">${p.open_positions} open positions</div>
+        </div>
+        <div class="card green">
+          <div class="label">Pending EV</div>
+          <div class="value" style="color:var(--green)">${fmt(p.pending_ev)}</div>
+          <div class="sub">Expected profit</div>
+        </div>
+        <div class="card">
+          <div class="label">PnL Realized</div>
+          <div class="value">${fmt(p.pnl_realized)}</div>
+          <div class="sub">${perf.resolved} resolved</div>
+        </div>
+      </div>
+    </div>
+    <div class="section">
+      <div class="section-title">Arb Performance</div>
+      <div class="card-grid">
+        <div class="card ${wrColor}">
+          <div class="label">Win Rate</div>
+          <div class="value" style="font-size:20px">${wr}</div>
+          <div class="sub">Target ≥ 65%</div>
+        </div>
+        <div class="card ${perf.fill_rate >= 0.20 ? 'green':'yellow'}">
+          <div class="label">Fill Rate</div>
+          <div class="value" style="font-size:20px">${pct(perf.fill_rate)}</div>
+          <div class="sub">${perf.matched} matched / ${perf.arb_total} placed</div>
+        </div>
+        <div class="card ${perf.avg_dev >= 0.06 ? 'green':'yellow'}">
+          <div class="label">Avg Deviation</div>
+          <div class="value" style="font-size:20px">${(perf.avg_dev*100).toFixed(1)}%</div>
+          <div class="sub">${pct(perf.pct_above_06)} above 6%</div>
+        </div>
+        <div class="card">
+          <div class="label">Arb Trades</div>
+          <div class="value" style="font-size:20px">${perf.arb_total}</div>
+          <div class="sub">${perf.resolved} resolved</div>
+        </div>
+      </div>
+    </div>
+    <div class="section">
+      <div class="section-title">$500 Gate Progress</div>
+      <div class="card">
+        <div class="gate-row"><span>Resolved trades</span><span>${perf.resolved} / 30</span></div>
+        <div class="gate-bar"><div class="gate-fill ${perf.resolved >= 30 ? 'green' : perf.resolved >= 15 ? 'yellow' : 'red'}" style="width:${Math.min(perf.resolved/30*100,100).toFixed(0)}%"></div></div>
+        <div style="font-size:11px;color:var(--muted)">Day ${d.days_running} · ${Math.max(0,30-perf.resolved)} more needed</div>
+      </div>
+    </div>
+  `;
+}
+
+function renderScanner(d) {
+  const s   = d.scanner;
+  const perf = d.performance;
+  const ageOk = s.active && s.last_trigger_min < 10;
+  const ageWarn = s.active && s.last_trigger_min >= 10 && s.last_trigger_min < 30;
+  const logHtml = (s.log || []).map(function(line) {
+    const cls = line.includes('arb_signal') || line.includes('cash_returned') ? 'signal' :
+                line.includes('idle') || line.includes('nothing to do') ? 'idle' : '';
+    return `<div class="log-line ${cls}">${line}</div>`;
+  }).join('');
+
+  document.getElementById('pane-scanner').innerHTML = `
+    <div class="section">
+      <div class="section-title">Scanner Status</div>
+      <div class="card-grid">
+        <div class="card ${s.active ? 'green' : 'red'}">
+          <div class="label">Service</div>
+          <div class="value" style="font-size:18px;color:var(--${s.active?'green':'red'})">${s.active ? '✅ Active' : '❌ Down'}</div>
+          <div class="sub">polymarket-scanner</div>
+        </div>
+        <div class="card ${ageOk ? 'green' : ageWarn ? 'yellow' : 'red'}">
+          <div class="label">Last Trigger</div>
+          <div class="value" style="font-size:18px">${s.last_trigger_min < 0 ? '?' : s.last_trigger_min.toFixed(0) + 'm'}</div>
+          <div class="sub">Scan interval: 60s</div>
+        </div>
+        <div class="card ${s.cash > 2 ? 'green' : 'yellow'}">
+          <div class="label">Cash</div>
+          <div class="value" style="font-size:18px">${fmt(s.cash)}</div>
+          <div class="sub">${s.cash < 2 ? 'Waiting for resolution' : 'Ready to deploy'}</div>
+        </div>
+        <div class="card">
+          <div class="label">Fill Rate</div>
+          <div class="value" style="font-size:18px">${pct(perf.fill_rate)}</div>
+          <div class="sub">${perf.matched} / ${perf.arb_total} filled</div>
+        </div>
+      </div>
+    </div>
+    <div class="section">
+      <div class="section-title">Scanner Log (last 15 lines)</div>
+      <div class="card" style="padding:8px">
+        ${logHtml || '<div class="log-line idle">No log data</div>'}
+      </div>
+    </div>
+    <div class="section">
+      <div class="section-title">Arb Quality</div>
+      <div class="card">
+        <div class="row">
+          <div><div class="name">Avg Deviation</div><div class="meta">All arb trades</div></div>
+          <div class="right"><span class="badge ${perf.avg_dev >= 0.06 ? 'green' : 'yellow'}">${(perf.avg_dev*100).toFixed(2)}%</span></div>
+        </div>
+        <div class="row">
+          <div><div class="name">Above 6% Threshold</div><div class="meta">Quality signals</div></div>
+          <div class="right"><span class="badge ${perf.pct_above_06 >= 0.5 ? 'green' : 'yellow'}">${pct(perf.pct_above_06)}</span></div>
+        </div>
+        <div class="row">
+          <div><div class="name">Total Arb Placed</div></div>
+          <div class="right"><strong>${perf.arb_total}</strong></div>
+        </div>
+        <div class="row" style="border:none">
+          <div><div class="name">Pending EV</div><div class="meta">Expected profit in open positions</div></div>
+          <div class="right" style="color:var(--green)"><strong>$${perf.pending_ev.toFixed(2)}</strong></div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderTrades(d) {
+  const rows = (d.trades || []).map(function(t) {
+    const dir = t.direction || '';
+    const isYes = dir.includes('YES');
+    const dirBadge = `<span class="badge ${isYes ? 'green' : 'red'}">${isYes ? 'YES' : 'NO'}</span>`;
+    const outBadge = t.outcome !== null && t.outcome !== undefined
+      ? badge(String(t.outcome).toUpperCase(), String(t.outcome).toLowerCase().includes('win') || t.outcome === true ? 'green' : 'red')
+      : statusBadge(t.status);
+    const dev = t.dev !== null && t.dev !== undefined ? `<span style="color:var(--${t.dev>=0.06?'green':'muted'})">${(t.dev*100).toFixed(1)}%</span>` : '—';
+    return `<tr>
+      <td style="color:var(--muted)">${t.ts.slice(5,16)}</td>
+      <td><strong>${t.city}</strong></td>
+      <td>${dirBadge}</td>
+      <td>${t.price.toFixed(3)}</td>
+      <td>$${t.bet.toFixed(2)}</td>
+      <td>${dev}</td>
+      <td>${outBadge}</td>
+    </tr>`;
+  }).join('');
+
+  document.getElementById('pane-trades').innerHTML = `
+    <div class="section">
+      <div class="section-title">Last 50 Trades</div>
+      <div style="overflow-x:auto">
+        <table class="trade-table">
+          <thead><tr>
+            <th>Time</th><th>City</th><th>Dir</th><th>Price</th><th>Bet</th><th>Dev</th><th>Status</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function renderGate(d) {
+  const g = d.gate;
+  function gateBlock(title, amount, gate) {
+    const checks = [
+      { label: 'Resolved ≥ ' + gate.resolved_target, val: gate.resolved, target: gate.resolved_target, fmt: v => v + ' trades' },
+      { label: 'Win Rate ≥ ' + pct(gate.wr_target),  val: gate.win_rate, target: gate.wr_target, fmt: v => v === null ? 'TBD' : pct(v), pctMode: true },
+      { label: 'Fill Rate ≥ ' + pct(gate.fill_target), val: gate.fill_rate, target: gate.fill_target, fmt: pct, pctMode: true },
+      { label: 'Avg Dev ≥ ' + pct(gate.dev_target),  val: gate.avg_dev,  target: gate.dev_target, fmt: v => (v*100).toFixed(2)+'%', pctMode: true },
+    ];
+    const allPass = checks.every(c => c.val !== null && c.val >= c.target);
+    const checkHtml = checks.map(function(c) {
+      const ok  = c.val !== null && c.val >= c.target;
+      const tbd = c.val === null;
+      const icon = tbd ? '⏳' : ok ? '✅' : '❌';
+      const valStr = tbd ? 'TBD' : c.fmt(c.val);
+      return `<div class="row">
+        <div><div class="name">${icon} ${c.label}</div></div>
+        <div class="right"><span class="badge ${tbd?'muted':ok?'green':'red'}">${valStr}</span></div>
+      </div>`;
+    }).join('');
+    const pct_done = Math.min(gate.resolved / gate.resolved_target, 1);
+    return `
+      <div class="section">
+        <div class="section-title">${title} — Deposit ${amount}</div>
+        <div class="card ${allPass ? 'green' : ''}">
+          ${allPass ? '<div style="color:var(--green);font-weight:700;margin-bottom:8px;font-size:15px">🎉 GATE PASSED — Ready to deposit!</div>' : ''}
+          ${checkHtml}
+          <div style="margin-top:10px">
+            <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-bottom:4px">
+              <span>Progress</span><span>${gate.resolved} / ${gate.resolved_target} resolved</span>
+            </div>
+            <div class="gate-bar"><div class="gate-fill ${pct_done >= 1 ? 'green' : pct_done > 0.5 ? 'yellow' : 'red'}" style="width:${(pct_done*100).toFixed(0)}%"></div></div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  document.getElementById('pane-gate').innerHTML = `
+    ${gateBlock('$500 Gate', '$500', g.g500)}
+    ${gateBlock('$2000 Gate', '$2,000', g.g2000)}
+    <div class="section">
+      <div class="section-title">Scale-Up Logic</div>
+      <div class="card">
+        <div class="row"><div class="name">Strategy</div><div class="right"><span class="badge blue">Bucket Sum Arb</span></div></div>
+        <div class="row"><div class="name">Math Guarantee</div><div class="right" style="font-size:12px;color:var(--muted)">Σ buckets = 1.0</div></div>
+        <div class="row"><div class="name">Min Deviation</div><div class="right"><span class="badge green">6%</span></div></div>
+        <div class="row"><div class="name">Kelly Fraction</div><div class="right">0.5× (half-Kelly)</div></div>
+        <div class="row" style="border:none"><div class="name">Capital Cycle</div><div class="right" style="font-size:12px;color:var(--muted)">Redeploy within 60s</div></div>
+      </div>
+    </div>
+  `;
+}
+
+function renderSystem(d) {
+  const s = d.system;
+  function sysRow(name, ageMin, warnThresh, critThresh) {
+    const ok   = ageMin >= 0 && ageMin < warnThresh;
+    const warn = ageMin >= warnThresh && ageMin < critThresh;
+    const crit = ageMin < 0 || ageMin >= critThresh;
+    const dotCls = ok ? 'dot-green' : warn ? 'dot-yellow' : 'dot-red';
+    const ageStr = ageMin < 0 ? 'no log' : ageMin < 60 ? ageMin+'m ago' : Math.floor(ageMin/60)+'h '+ageMin%60+'m ago';
+    const badge_s = ok ? badge('OK','green') : warn ? badge('AGING','yellow') : badge('STALE','red');
+    return `<div class="sys-row">
+      <div style="display:flex;align-items:center"><span class="sys-dot ${dotCls}"></span><strong>${name}</strong></div>
+      <div style="display:flex;align-items:center;gap:8px"><span style="font-size:11px;color:var(--muted)">${ageStr}</span>${badge_s}</div>
+    </div>`;
+  }
+
+  const diskColor = s.disk_pct > 85 ? 'red' : s.disk_pct > 70 ? 'yellow' : 'green';
+  const memColor  = s.mem_pct  > 85 ? 'red' : s.mem_pct  > 70 ? 'yellow' : 'green';
+
+  document.getElementById('pane-system').innerHTML = `
+    <div class="section">
+      <div class="section-title">Services</div>
+      <div class="card">
+        <div class="sys-row">
+          <div style="display:flex;align-items:center"><span class="sys-dot ${s.scanner_active?'dot-green':'dot-red'}"></span><strong>Scanner (systemd)</strong></div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span style="font-size:11px;color:var(--muted)">${s.scanner_age_min >= 0 ? s.scanner_age_min.toFixed(0)+'m ago' : '?'}</span>
+            ${s.scanner_active ? badge('ACTIVE','green') : badge('DOWN','red')}
+          </div>
+        </div>
+        ${sysRow('Autosell', s.autosell_age_min, 10, 30)}
+        ${sysRow('Truth Resolution', s.truth_age_min, 130, 300)}
+        ${sysRow('Daily Check', s.daily_check_age_min, 1500, 1700)}
+        ${sysRow('EMOS Train', s.emos_age_min, 1500, 2880)}
+      </div>
+    </div>
+    <div class="section">
+      <div class="section-title">Resources</div>
+      <div class="card-grid">
+        <div class="card ${diskColor}">
+          <div class="label">Disk</div>
+          <div class="value" style="color:var(--${diskColor})">${s.disk_pct}%</div>
+          <div class="sub">/ partition</div>
+        </div>
+        <div class="card ${memColor}">
+          <div class="label">Memory</div>
+          <div class="value" style="color:var(--${memColor})">${s.mem_pct}%</div>
+          <div class="sub">RAM used</div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+</script>
+</body>
+</html>
