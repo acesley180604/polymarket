@@ -25,3 +25,4 @@ __pycache__/
 *.pyc
 .cleanup-backup-20260420-backtestfix.py
 scanner_state.json
+.tunnel_url
