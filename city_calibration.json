@@ -1,0 +1,107 @@
+{
+  "lagos": {
+    "city": "lagos",
+    "n": 91,
+    "mae": 0.78,
+    "brier": 0.3279,
+    "status": "\u26a0\ufe0f MARGINAL"
+  },
+  "manila": {
+    "city": "manila",
+    "n": 91,
+    "mae": 0.41,
+    "brier": 0.2211,
+    "status": "\u26a0\ufe0f MARGINAL"
+  },
+  "kuala lumpur": {
+    "city": "kuala lumpur",
+    "n": 91,
+    "mae": 0.91,
+    "brier": 0.229,
+    "status": "\u26a0\ufe0f MARGINAL"
+  },
+  "dallas": {
+    "city": "dallas",
+    "n": 91,
+    "mae": 0.36,
+    "brier": 0.1499,
+    "status": "\u2705 READY"
+  },
+  "hong kong": {
+    "city": "hong kong",
+    "n": 91,
+    "mae": 0.5,
+    "brier": 0.1776,
+    "status": "\u2705 READY"
+  },
+  "seoul": {
+    "city": "seoul",
+    "n": 91,
+    "mae": 0.28,
+    "brier": 0.1538,
+    "status": "\u2705 READY"
+  },
+  "tokyo": {
+    "city": "tokyo",
+    "n": 91,
+    "mae": 0.33,
+    "brier": 0.1499,
+    "status": "\u2705 READY"
+  },
+  "london": {
+    "city": "london",
+    "n": 91,
+    "mae": 0.18,
+    "brier": 0.1024,
+    "status": "\u2705 READY"
+  },
+  "shanghai": {
+    "city": "shanghai",
+    "n": 91,
+    "mae": 0.18,
+    "brier": 0.1301,
+    "status": "\u2705 READY"
+  },
+  "new york city": {
+    "city": "new york city",
+    "n": 91,
+    "mae": 0.85,
+    "brier": 0.1815,
+    "status": "\u2705 READY"
+  },
+  "jeddah": {
+    "city": "jeddah",
+    "n": 91,
+    "mae": 0.45,
+    "brier": 0.2013,
+    "status": "\u2705 READY"
+  },
+  "jakarta": {
+    "city": "jakarta",
+    "n": 91,
+    "mae": 0.49,
+    "brier": 0.2488,
+    "status": "\u26a0\ufe0f MARGINAL"
+  },
+  "paris": {
+    "city": "paris",
+    "n": 91,
+    "mae": 0.32,
+    "brier": 0.1657,
+    "status": "\u2705 READY"
+  },
+  "buenos aires": {
+    "city": "buenos aires",
+    "n": 91,
+    "mae": 0.4,
+    "brier": 0.1894,
+    "status": "\u2705 READY"
+  },
+  "moscow": {
+    "city": "moscow",
+    "n": 91,
+    "mae": 0.37,
+    "brier": 0.1934,
+    "status": "\u2705 READY"
+  }
+}
