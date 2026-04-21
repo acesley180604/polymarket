@@ -317,29 +317,29 @@ def fetch_usdc_balance():
     """
     Fetch available USDC cash and total portfolio value.
     Returns (usdc_cash, total_portfolio_value).
-    Tries multiple endpoints; falls back to BANKROLL_OVERRIDE in .env.
+    Uses Polygon RPC for live USDC balance; falls back to BANKROLL_OVERRIDE.
     """
     address = _env.get("POLY_ADDRESS", "")
     override = _env.get("BANKROLL_OVERRIDE", "")
     if not address:
         return float(override or 0), 0.0
 
-    # Try 1: L2-authenticated balance endpoint
-    usdc_cash = 0.0
-    for path in ["/balance", f"/balance?address={address}"]:
+    # Try: Polygon on-chain USDC balance (6 decimals)
+    USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    usdc_cash = None  # None=RPC failed, 0.0=genuine zero
+    for rpc in ["https://polygon-rpc.com", "https://rpc.ankr.com/polygon"]:
         try:
-            r = requests.get(
-                f"https://clob.polymarket.com{path}",
-                headers=_l2_headers("GET", path),
-                timeout=8,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                val = (data.get("balance") or data.get("USDC") or
-                       data.get("usdc") or data.get("available") or 0)
-                usdc_cash = float(val)
-                if usdc_cash > 0:
-                    break
+            payload = {
+                "jsonrpc": "2.0", "method": "eth_call",
+                "params": [{"to": USDC_CONTRACT,
+                             "data": "0x70a08231000000000000000000000000" + address[2:]},
+                            "latest"],
+                "id": 1,
+            }
+            r = requests.post(rpc, json=payload, timeout=8)
+            result = r.json().get("result", "0x0")
+            usdc_cash = int(result, 16) / 1e6
+            break
         except Exception:
             pass
 
@@ -358,10 +358,10 @@ def fetch_usdc_balance():
     except Exception:
         pass
 
-    # Fallback to .env override if API returned nothing
-    if usdc_cash == 0 and override:
-        usdc_cash = float(override)
-        print(f"    (using BANKROLL_OVERRIDE from .env: ${usdc_cash:.2f})", flush=True)
+    # Fallback ONLY if RPC itself failed (None), not if it returned real 0
+    if usdc_cash is None:
+        usdc_cash = float(override) if override else 0.0
+        print(f"    (RPC failed — using BANKROLL_OVERRIDE: ${usdc_cash:.2f})", flush=True)
 
     return usdc_cash, portfolio_val
 

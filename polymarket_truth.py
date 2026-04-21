@@ -21,6 +21,61 @@ CALIB_STATS_DEFAULT   = CALIBRATION_STATS_JSON
 
 HKO_API  = "https://data.weather.gov.hk/weatherAPI/opendata/climate.php"
 ERA5_API = "https://archive-api.open-meteo.com/v1/archive"
+
+# City lat/lon for ERA5 multi-city resolution
+CITY_COORDS = {
+    "hong kong":    (22.3020,  114.1739),
+    "hk":           (22.3020,  114.1739),
+    "lagos":        (6.4550,   3.3841),
+    "manila":       (14.5995,  120.9842),
+    "singapore":    (1.3521,   103.8198),
+    "seoul":        (37.5665,  126.9780),
+    "kuala lumpur": (3.1390,   101.6869),
+    "kl":           (3.1390,   101.6869),
+    "dallas":       (32.7767,  -96.7970),
+    "london":       (51.5074,  -0.1278),
+    "wellington":   (-41.2865, 174.7762),
+    "lucknow":      (26.8467,  80.9462),
+    "tokyo":        (35.6762,  139.6503),
+    "sydney":       (-33.8688, 151.2093),
+    "new york":     (40.7128,  -74.0060),
+    "bangkok":      (13.7563,  100.5018),
+    "dubai":        (25.2048,  55.2708),
+    "mumbai":       (19.0760,  72.8777),
+}
+
+def fetch_era5_actual(date_str, lat, lon):
+    try:
+        r = requests.get(
+            ERA5_API,
+            params={
+                "latitude": lat, "longitude": lon,
+                "start_date": date_str, "end_date": date_str,
+                "daily": "temperature_2m_max",
+                "timezone": "auto", "temperature_unit": "celsius",
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        vals = r.json().get("daily", {}).get("temperature_2m_max", [])
+        if vals and vals[0] is not None:
+            return float(vals[0])
+    except Exception as e:
+        print(f"  [ERA5] Failed ({lat},{lon}) {date_str}: {e}", flush=True)
+    return None
+
+def fetch_actual_for_city(city, date_str):
+    city_lc = city.lower().strip()
+    if "hong kong" in city_lc or city_lc == "hk":
+        val = fetch_hko_actual(date_str)
+        if val is not None:
+            return val
+    for key, (lat, lon) in CITY_COORDS.items():
+        if key in city_lc or city_lc in key:
+            return fetch_era5_actual(date_str, lat, lon)
+    print(f"  [resolve] Unknown city coords: {city}", flush=True)
+    return None
+
 HK_LAT   = 22.3020
 HK_LON   = 114.1739
 
@@ -232,11 +287,7 @@ def resolve_trades(trades_jsonl_path: str, truth_cache_path: str) -> list:
         question = trade.get("question", "")
         city     = trade.get("city", "")
 
-        # Only auto-resolve HK markets (truth source is HKO)
-        if "hong kong" not in city.lower() and "hk" not in city.lower():
-            # For non-HK cities, mark as needs_manual_resolution
-            trade["outcome_note"] = "non-hk: manual resolution needed"
-            continue
+        # Resolve all supported cities via ERA5 / HKO
 
         # Parse bucket from question
         bucket = parse_question_bucket(question)
@@ -249,16 +300,17 @@ def resolve_trades(trades_jsonl_path: str, truth_cache_path: str) -> list:
 
         # Fetch actual temp (with cache)
         date_key = end_date_str[:10]
-        if date_key not in truth_cache:
-            actual_c = fetch_hko_actual(date_key)
+        cache_key = f"{city.lower()}:{date_key}"
+        if cache_key not in truth_cache:
+            actual_c = fetch_actual_for_city(city, date_key)
             if actual_c is not None:
-                truth_cache[date_key] = actual_c
-                print(f"  [resolve] {date_key}: HKO actual = {actual_c:.1f}°C", flush=True)
+                truth_cache[cache_key] = actual_c
+                print(f"  [resolve] {city} {date_key}: actual={actual_c:.1f}C", flush=True)
             else:
-                print(f"  [resolve] {date_key}: could not fetch actual — skipping", flush=True)
+                print(f"  [resolve] {city} {date_key}: no data — skipping", flush=True)
                 continue
         else:
-            actual_c = truth_cache[date_key]
+            actual_c = truth_cache[cache_key]
 
         # Determine outcome
         direction = trade.get("direction", "BUY YES")
