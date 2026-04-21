@@ -41,21 +41,21 @@ from polymarket_core import ENV as _env, CITY_COORDS, detect_city, parse_temp_ra
 # All tier caps are % of bankroll — scales correctly from $10 to $10,000.
 
 TIERS = [
-    {"name":"A", "min_conf":0.70, "min_edge":0.25, "kelly":1/4, "max_pct":0.05, "label":"🔥🔥"},
-    {"name":"B", "min_conf":0.60, "min_edge":0.18, "kelly":1/4, "max_pct":0.03, "label":"🔥 "},
-    {"name":"C", "min_conf":0.52, "min_edge":0.20, "kelly":1/4, "max_pct":0.02, "label":"→  "},
+    {"name":"A", "min_conf":0.70, "min_edge":0.25, "kelly":1/2, "max_pct":0.20, "label":"🔥🔥"},
+    {"name":"B", "min_conf":0.60, "min_edge":0.18, "kelly":1/3, "max_pct":0.12, "label":"🔥 "},
+    {"name":"C", "min_conf":0.52, "min_edge":0.20, "kelly":1/4, "max_pct":0.06, "label":"→  "},
 ]
 
-MAX_PCT_BANKROLL  = 0.05   # Hard cap: 5% bankroll per bet
-MAX_POSITIONS     = 20     # Max concurrent positions
-MAX_PER_CITY      = 2      # Max 2 bets per city (correlation rule)
-DAILY_EXPOSURE    = 0.30   # Max 30% bankroll deployed per day
+MAX_PCT_BANKROLL  = 0.20   # Hard cap: 20% bankroll per bet (Tier A arb)
+MAX_POSITIONS     = 50     # Max concurrent positions
+MAX_PER_CITY      = 4      # Max 2 bets per city (correlation rule)
+DAILY_EXPOSURE    = 1.00   # Max 30% bankroll deployed per day
 DAILY_LOSS_LIMIT  = 0.15   # Stop at -15% bankroll loss
 MAX_ENTRY_PRICE   = 0.72   # Skip YES > 72¢ (not enough reward)
 MIN_BET_USD       = 0.50   # Polymarket practical minimum
 MIN_BANKROLL      = 1.0    # Minimum to trade live (T1 seed = $2, 100 buy-in rule)
 FORECAST_HORIZON  = "tomorrow"  # Tomorrow only — no same-day bets
-ARB_MIN_DEVIATION = float(_env.get("ARB_MIN_DEVIATION", "0.04"))
+ARB_MIN_DEVIATION = float(_env.get("ARB_MIN_DEVIATION", "0.06"))
 _CITY_CALIBRATION_CACHE = {"loaded_at": 0.0, "data": {}}
 _CITY_CALIBRATION_TTL = 6 * 3600
 PRECISION_WINDOW_HOURS = 6.0
@@ -697,9 +697,9 @@ def run():
               f"({'GOOD' if brier < 0.15 else 'OK' if brier < 0.25 else 'WEAK'})", flush=True)
     print("=" * 72, flush=True)
 
-    day_offsets = [1]
+    day_offsets = [1, 2]
     if 10 <= now_utc.hour <= 16:
-        day_offsets = [0, 1]
+        day_offsets = [0, 1, 2]
     print(f"\n[1] Fetching target markets (offsets={day_offsets})...", flush=True)
     markets = fetch_target_markets(day_offsets)
     active  = [m for m in markets if m.get("active") and m.get("clobTokenIds")]
@@ -1070,7 +1070,7 @@ def run():
     # If sum < $1: buy every bucket → one pays $1, guaranteed profit.
     # If sum > $1: buy every NO → n-1 pay $1, guaranteed profit.
     arb_signals = []
-    ARB_BET_PER_LEG   = 0.50
+    def _arb_bet(dev, br, tmax=5.0): return round(min(max(br*0.025, 0.50) + min(abs(dev)/0.06,1.0)*(tmax-max(br*0.025,0.50)), tmax), 2)
     city_date_buckets = {}
     for m in parsed:
         key = (m["city"], m["end_date"])
@@ -1087,7 +1087,7 @@ def run():
         if abs(deviation) < ARB_MIN_DEVIATION:
             continue
         direction = "BUY YES ALL" if deviation < 0 else "BUY NO ALL"
-        guaranteed_profit = abs(deviation) * ARB_BET_PER_LEG
+        guaranteed_profit = abs(deviation) * _arb_bet(deviation, bankroll)
         print(f"  [{city.upper():15s}] {end_date}  sum={yes_sum:.3f}  "
               f"deviation={deviation:+.3f}  → {direction}  "
               f"guaranteed≈${guaranteed_profit:.3f}/leg", flush=True)
@@ -1107,8 +1107,8 @@ def run():
                 "yes_price":   p,
                 "f_prob":      1.0 / len(bucket_list),
                 "edge":        abs(deviation),
-                "bet":         ARB_BET_PER_LEG,
-                "ev":          guaranteed_profit,
+                "bet":         _arb_bet(deviation, bankroll),
+                "ev":          round(abs(deviation) * _arb_bet(deviation, bankroll), 4),
                 "rng":         rng,
                 "tier_cfg":    {"name": "ARB", "label": "⚡"},
                 "urgency":     "arb",

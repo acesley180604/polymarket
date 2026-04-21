@@ -23,3 +23,5 @@ tg_chat_ids.json
 # python
 __pycache__/
 *.pyc
+.cleanup-backup-20260420-backtestfix.py
+scanner_state.json

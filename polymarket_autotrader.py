@@ -13,6 +13,7 @@ Cron:
 """
 
 import sys, json, time, requests, os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from polymarket_core import ENV as _env, CLOB_API, GAMMA_API, discord_post, get_clob_client as _get_clob_client, l2_headers as _l2_headers, TRADES_JSONL as _TRADES_JSONL_DEFAULT, CALIBRATION_STATS_JSON
 import polymarket_capital as cap_mod
@@ -26,6 +27,20 @@ ACCOUNTING_MODE = _env.get("ACCOUNTING_MODE", "paper" if DRY_RUN else "live").st
 CITY_FILTER  = [c.strip().lower() for c in _env.get("CITY_FILTER", "").split(",") if c.strip()]
 
 TRADE_LOG   = _TRADES_JSONL_DEFAULT
+import fcntl as _fcntl
+LOCK_FILE = "/tmp/polymarket_autotrader.lock"
+
+def _acquire_lock():
+    lf = open(LOCK_FILE, "w")
+    try:
+        _fcntl.flock(lf, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        return lf
+    except OSError:
+        print("[LOCK] Another autotrader run is in progress. Exiting.", flush=True)
+        lf.close()
+        return None
+
+
 
 # ─── ORDER PLACEMENT ──────────────────────────────────────
 CHAIN_ID   = 137
@@ -127,6 +142,9 @@ def place_order(token_id: str, price: float, size_usdc: float, side: int, dry_ru
         raw_shares = size_usdc / price if side == 0 else size_usdc
         shares = max(raw_shares, MIN_SHARES)  # enforce Polymarket minimum
         bumped_cost = shares * price
+        # Polymarket hard minimum $1 per order
+        if bumped_cost < 1.0:
+            return {"skipped": True, "reason": "below_poly_min_1usd", "cost": bumped_cost}
         if max_usdc is not None and bumped_cost > max_usdc:
             msg = (f"         (skipped: 5-share min would cost ${bumped_cost:.2f}, "
                    f"exceeds tier cap ${max_usdc:.2f})")
@@ -183,12 +201,19 @@ def log_trade(signal, result, source):
         "created_ts": signal.get("created_ts", ""),
         "execution_type": signal.get("execution_type"),
         "execution_notes": signal.get("execution_notes"),
+        "reward_context": signal.get("reward_context"),
         "decision_snapshot": signal.get("decision_snapshot"),
         "post_order_snapshot": signal.get("post_order_snapshot"),
         "execution_audit": _build_execution_audit(signal, result),
         "hedge_group": signal.get("hedge_group"),
         "hedge_role": signal.get("hedge_role"),
     }
+    # Never log skipped or failed orders
+    r = result or {}
+    if r.get("skipped") or r.get("error") or ("min size" in str(r.get("error_message","")).lower()):
+        return
+    if not (r.get("orderID") or r.get("success") or r.get("status") == "dry_run"):
+        return
     with open(TRADE_LOG, "a") as f:
         f.write(json.dumps(entry) + "\n")
 
@@ -254,6 +279,61 @@ def _classify_bucket_sum_arb(signal, order_type):
     }
 
 
+def _enrich_signal_reward_context(signal, force_refresh: bool = False):
+    token = signal.get("order_token") or signal.get("token_id")
+    if not token:
+        signal["reward_context"] = {}
+        return signal
+    signal_price = signal.get("trade_price") or signal.get("yes_price") or signal.get("price") or 0.0
+    bet = float(signal.get("bet") or 0.0)
+    try:
+        signal["reward_context"] = exec_mod.get_reward_context(str(token), float(signal_price or 0.0), bet, force_refresh=force_refresh)
+    except Exception as e:
+        signal["reward_context"] = {"error": str(e)}
+    return signal
+
+
+def _signal_priority(signal):
+    setup_type = signal.get("setup_type") or ""
+    strategy_arm = signal.get("strategy_arm") or ""
+    reward = signal.get("reward_context") or {}
+    reward_score = float(reward.get("reward_score") or 0.0)
+    reward_live = 1 if reward.get("eligible") else 0
+    reward_size = 1 if reward.get("size_ok_for_rewards") else 0
+
+    if setup_type == "bucket_sum_arb" or strategy_arm in {"bucket_sum_arb_loose", "bucket_sum_arb_candidate"}:
+        tier_rank = 0
+    elif setup_type == "precision_bracket" or str(strategy_arm).startswith("precision_"):
+        tier_rank = 1
+    elif strategy_arm in {"directional_b", "conviction_b"}:
+        tier_rank = 2
+    elif strategy_arm in {"directional_a", "conviction_a"}:
+        tier_rank = 4
+    else:
+        tier_rank = 3
+
+    return (
+        tier_rank,
+        -reward_size,
+        -reward_live,
+        -reward_score,
+        -abs(float(signal.get("edge", 0.0) or 0.0)),
+        -float(signal.get("ev", 0.0) or 0.0),
+    )
+
+
+def _print_reward_summary(signals):
+    reward_live = sum(1 for s in signals if (s.get("reward_context") or {}).get("eligible"))
+    reward_size = sum(1 for s in signals if (s.get("reward_context") or {}).get("size_ok_for_rewards"))
+    if reward_live:
+        print(
+            f"  [maker] reward-active markets: {reward_live} | rebate-size-qualified: {reward_size}",
+            flush=True,
+        )
+
+
+
+
 def _resolve_bankroll():
     try:
         import polymarket_model as _pm_tmp
@@ -303,7 +383,57 @@ def _trim_precision_groups(signals):
     return passthrough + trimmed
 
 # ─── MAIN ─────────────────────────────────────────────────
+# ─── PARALLEL ARB EXECUTION ───────────────────────────────
+def execute_arb_group(signals, tier_cfg, dry_run, source="arb"):
+    """
+    Execute all legs of a bucket-sum arb group in parallel.
+    Jane Street principle: all legs must fire simultaneously or the arb breaks.
+    Returns list of (signal, result) tuples.
+    """
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for s in signals:
+        grp = s.get("hedge_group") or (s.get("city","") + "_" + s.get("end_date",""))
+        groups[grp].append(s)
+
+    all_results = []
+    for grp, legs in groups.items():
+        city = legs[0].get("city","?").upper()
+        dev = legs[0].get("arb_deviation", 0)
+        print(f"\n  [ARB PARALLEL] {city} dev={dev:.3f} legs={len(legs)} — firing all simultaneously", flush=True)
+
+        def _place_leg(s):
+            token = s.get("order_token") or s.get("token_id")
+            price = s.get("trade_price") or s.get("yes_price", 0)
+            bet   = min(float(s.get("bet", 0.50)), tier_cfg["max_bet"])
+            s["effective_bet"] = bet
+            s["execution_type"] = "ARB_MARKET"
+            s["execution_notes"] = f"parallel arb | dev={dev:.3f} | legs={len(legs)}"
+            result = place_order(str(token), price, bet, 0, dry_run, max_usdc=tier_cfg["max_bet"])
+            return s, result
+
+        with ThreadPoolExecutor(max_workers=min(len(legs), 10)) as ex:
+            futures = [ex.submit(_place_leg, s) for s in legs]
+            for fut in as_completed(futures):
+                s, result = fut.result()
+                filled = bool(result.get("success") or result.get("orderID"))
+                print(f"    leg {s.get(rng,)} {s.get(direction,)} bet=${s.get(effective_bet,0):.2f} → {OK if filled else FAIL}", flush=True)
+                log_trade(s, result, source)
+                all_results.append((s, result))
+
+        filled_count = sum(1 for _, r in all_results[-len(legs):] if r.get("success") or r.get("orderID"))
+        if filled_count < len(legs):
+            print(f"  [ARB WARNING] only {filled_count}/{len(legs)} legs filled — partial arb exposure!", flush=True)
+        else:
+            total_bet = sum(s.get("effective_bet",0) for s, _ in all_results[-len(legs):])
+            print(f"  [ARB COMPLETE] all {len(legs)} legs filled | deployed=${total_bet:.2f} | guaranteed EV=${dev*total_bet/len(legs):.3f}", flush=True)
+
+    return all_results
+
 def run():
+    _lock = _acquire_lock()
+    if _lock is None:
+        return
     now     = datetime.now(timezone.utc)
     bankroll = _resolve_bankroll()
     mode_str = "🔴 LIVE" if not DRY_RUN else "📋 DRY RUN"
@@ -436,6 +566,11 @@ def run():
         except Exception as e:
             print(f"  [portfolio Kelly failed, using single-bet sizes]: {e}", flush=True)
 
+    for s in deduped:
+        _enrich_signal_reward_context(s)
+    deduped.sort(key=_signal_priority)
+    _print_reward_summary(deduped)
+
     # ── 4. Enforce remaining daily budget ────────────────
     deployed = 0
     final    = []
@@ -453,9 +588,17 @@ def run():
           f"|  Stop-loss: -${bankroll*0.15:.2f}", flush=True)
 
     # ── 5. Place orders ───────────────────────────────────
+    # Split: arb signals execute in parallel groups, conviction executes sequentially
+    arb_final = [s for s in final if s.get("setup_type") == "bucket_sum_arb"]
+    conv_final = [s for s in final if s.get("setup_type") != "bucket_sum_arb"]
+
+    if arb_final:
+        print(f"  [ARB] {len(arb_final)} arb legs → parallel execution", flush=True)
+        execute_arb_group(arb_final, _tier_cfg, DRY_RUN, source="arb")
+        placed_count = len(arb_final)
+
     placed_embeds = []
-    placed_count  = 0
-    for s in final:
+    for s in conv_final:
         token    = s.get("order_token") or s.get("token_id")
         signal_price = s.get("trade_price") or s.get("yes_price", 0)
         s["signal_price"] = signal_price
@@ -466,6 +609,7 @@ def run():
         side     = 0  # always BUY (YES or NO token directly)
         source   = s.get("_source", "?")
         spread   = exec_mod.get_market_spread(str(token)) or 0.03
+        s["reward_context"] = exec_mod.get_reward_context(str(token), signal_price, bet, force_refresh=True)
         s["decision_snapshot"] = exec_mod.capture_trade_snapshot(
             token_id=str(token),
             signal_price=signal_price,
@@ -475,6 +619,8 @@ def run():
             setup_type=s.get("setup_type", ""),
             force_refresh=True,
         )
+        if s["decision_snapshot"].get("reward_context"):
+            s["reward_context"] = s["decision_snapshot"].get("reward_context")
         final_price, order_type, exec_notes = exec_mod.place_smart_order(
             token_id=str(token),
             price=signal_price,
@@ -483,6 +629,8 @@ def run():
             spread=spread,
             hours_to_resolve=s.get("hours_to_resolution") or 24,
             setup_type=s.get("setup_type", ""),
+            reward_context=s.get("reward_context"),
+            book_snapshot=(s.get("decision_snapshot") or {}).get("book"),
         )
         s["execution_type"] = order_type
         s["execution_notes"] = exec_notes
@@ -580,3 +728,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+

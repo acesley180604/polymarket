@@ -347,7 +347,7 @@ def run(send_alerts: bool = True):
             if trade_price > MAX_ENTRY_PRICE or trade_price < MIN_ENTRY_PRICE:
                 unchanged += 1; continue
 
-            bet = kelly_size(trade_prob, trade_price, bankroll, 1/4, 0.05)
+            bet = kelly_size(trade_prob, trade_price, bankroll, 1/2, 0.20)
             if bet < 0.50:
                 continue
 

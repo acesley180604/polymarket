@@ -21,6 +21,8 @@ _TEMP_CACHE_TTL = 600         # 10 minutes
 _SPREAD_CACHE_TTL = 300       # 5 minutes
 _BOOK_CACHE: dict = {}        # {token_id: {"data": {...}, "ts": float}}
 _BOOK_CACHE_TTL = 120
+_REWARD_CACHE: dict = {"data": {}, "ts": 0.0}
+_REWARD_CACHE_TTL = 600
 
 HKO_RHRREAD_URL = (
     "https://data.weather.gov.hk/weatherAPI/opendata/weather.php"
@@ -31,6 +33,7 @@ HKO_FND_URL = (
     "?dataType=fnd&lang=en"
 )
 CLOB_BOOK_URL = CLOB_API + "/book?token_id={token_id}"
+CLOB_REWARDS_CURRENT_URL = CLOB_API + "/rewards/markets/current"
 
 HK_RESOLUTION_HOUR_UTC = 16   # 16:00 UTC = midnight HKT
 
@@ -119,22 +122,120 @@ def hours_to_resolution(market_end_date_str: str) -> float:
 # ---------------------------------------------------------------------------
 # 4. should_use_maker
 # ---------------------------------------------------------------------------
-def should_use_maker(market_spread: float, hours_to_resolve: float) -> bool:
+def _coerce_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_condition_id(value: str | None) -> str | None:
+    if value in (None, ""):
+        return None
+    return str(value).strip().lower()
+
+
+def _round_to_tick(price: float, tick_size: float) -> float:
+    tick = max(float(tick_size or 0.01), 0.001)
+    steps = round(price / tick)
+    return round(max(tick, steps * tick), 4)
+
+
+def get_active_reward_configs(force_refresh: bool = False) -> dict:
+    now = time.time()
+    if not force_refresh and _REWARD_CACHE["data"] and (now - _REWARD_CACHE["ts"]) < _REWARD_CACHE_TTL:
+        return _REWARD_CACHE["data"]
+    try:
+        resp = requests.get(CLOB_REWARDS_CURRENT_URL, timeout=10)
+        resp.raise_for_status()
+        payload = resp.json()
+        rows = payload.get("data", []) if isinstance(payload, dict) else []
+        by_condition = {}
+        for row in rows:
+            condition_id = _normalize_condition_id(row.get("condition_id"))
+            if condition_id:
+                by_condition[condition_id] = row
+        _REWARD_CACHE["data"] = by_condition
+        _REWARD_CACHE["ts"] = now
+        return by_condition
+    except Exception:
+        return _REWARD_CACHE["data"] if _REWARD_CACHE["data"] else {}
+
+
+def get_reward_context(
+    token_id: str,
+    signal_price: float,
+    size_usdc: float,
+    force_refresh: bool = False,
+    book: dict | None = None,
+) -> dict:
+    book = book or get_book_snapshot(token_id, force_refresh=force_refresh)
+    condition_id = _normalize_condition_id((book or {}).get("market"))
+    reward_cfg = get_active_reward_configs(force_refresh=force_refresh).get(condition_id)
+
+    ref_price = max(_coerce_float(signal_price, 0.0), _coerce_float((book or {}).get("ask"), 0.0), _coerce_float((book or {}).get("mid"), 0.0), 0.01)
+    estimated_shares = size_usdc / ref_price if ref_price > 0 else 0.0
+    rewards_min_size = _coerce_float((reward_cfg or {}).get("rewards_min_size"), 0.0)
+    rewards_max_spread_cents = _coerce_float((reward_cfg or {}).get("rewards_max_spread"), 0.0)
+    rewards_max_spread = rewards_max_spread_cents / 100.0 if rewards_max_spread_cents > 0 else None
+    reward_daily_rate = _coerce_float((reward_cfg or {}).get("total_daily_rate"), 0.0)
+    if reward_daily_rate <= 0:
+        reward_daily_rate = _coerce_float((reward_cfg or {}).get("native_daily_rate"), 0.0)
+    if reward_daily_rate <= 0:
+        reward_daily_rate = max((_coerce_float(cfg.get("rate_per_day"), 0.0) for cfg in (reward_cfg or {}).get("rewards_config", [])), default=0.0)
+
+    spread = _coerce_float((book or {}).get("spread"), 0.0) if book else None
+    spread_ok = bool(rewards_max_spread is not None and spread is not None and spread <= rewards_max_spread)
+    size_ok = bool(rewards_min_size > 0 and estimated_shares >= rewards_min_size)
+    size_ratio = min(estimated_shares / rewards_min_size, 1.0) if rewards_min_size > 0 else 0.0
+    reward_score = reward_daily_rate * (1.0 if spread_ok else 0.35) * (size_ratio if rewards_min_size > 0 else 0.0)
+
+    return {
+        "condition_id": condition_id,
+        "reward_daily_rate": round(reward_daily_rate, 6),
+        "rewards_min_size": round(rewards_min_size, 4) if rewards_min_size > 0 else None,
+        "rewards_max_spread": round(rewards_max_spread, 6) if rewards_max_spread is not None else None,
+        "estimated_shares": round(estimated_shares, 4),
+        "spread_ok_for_rewards": spread_ok,
+        "size_ok_for_rewards": size_ok,
+        "reward_score": round(reward_score, 6),
+        "book_spread": round(spread, 6) if spread is not None else None,
+        "eligible": bool(reward_daily_rate > 0),
+    }
+
+
+def should_use_maker(market_spread: float, hours_to_resolve: float, setup_type: str = "", reward_context: dict | None = None) -> bool:
     """
     Return True to use passive maker order, False to cross with taker order.
 
-    Maker if: spread > 0.03 AND hours_to_resolve > 6
-    Taker if: hours_to_resolve < 4 OR spread <= 0.02
-
-    Maker orders historically outperform by 2.5pp (post-Oct 2024 fee change).
+    Maker-first policy:
+    - reward-eligible markets prefer maker when spread is within reward tolerance
+    - bucket_sum_arb prefers maker unless the market is very urgent or ultra-tight
+    - directional setups can still cross when urgency is high
     """
+    reward_context = reward_context or {}
+    reward_live = reward_context.get("reward_daily_rate", 0.0) > 0
+    reward_spread_ok = reward_context.get("spread_ok_for_rewards", False)
+
+    if reward_live and reward_spread_ok and hours_to_resolve > 1:
+        return True
+
+    if setup_type == "bucket_sum_arb":
+        if hours_to_resolve <= 1.0:
+            return False
+        if market_spread is not None and market_spread <= 0.005 and hours_to_resolve < 3:
+            return False
+        return True
+
+    if setup_type == "precision_bracket" and hours_to_resolve > 2 and market_spread is not None and market_spread >= 0.01:
+        return True
+
     if hours_to_resolve < 4:
         return False
     if market_spread <= 0.02:
         return False
     if market_spread > 0.03 and hours_to_resolve > 6:
         return True
-    # Default: use maker when not urgent and spread is reasonable
     return True
 
 
@@ -175,6 +276,7 @@ def get_book_snapshot(token_id: str, force_refresh: bool = False) -> dict | None
             best_ask = best_bid
         data = {
             "captured_at": datetime.now(timezone.utc).isoformat(),
+            "market": book.get("market"),
             "bid": round(best_bid, 4),
             "ask": round(best_ask, 4),
             "mid": round((best_bid + best_ask) / 2.0, 4),
@@ -183,6 +285,10 @@ def get_book_snapshot(token_id: str, force_refresh: bool = False) -> dict | None
             "ask_depth": round(sum(level["size"] for level in asks), 4),
             "bid_notional": round(sum(level["price"] * level["size"] for level in bids), 4),
             "ask_notional": round(sum(level["price"] * level["size"] for level in asks), 4),
+            "min_order_size": _coerce_float(book.get("min_order_size"), 0.0),
+            "tick_size": _coerce_float(book.get("tick_size"), 0.01) or 0.01,
+            "neg_risk": bool(book.get("neg_risk")),
+            "last_trade_price": round(_coerce_float(book.get("last_trade_price"), 0.0), 4),
             "bids": [
                 {"price": round(level["price"], 4), "size": round(level["size"], 4)}
                 for level in bids
@@ -287,6 +393,7 @@ def capture_trade_snapshot(
     structure intended to be embedded into the canonical trade log.
     """
     book = get_book_snapshot(token_id, force_refresh=force_refresh)
+    reward_context = get_reward_context(token_id, signal_price, size_usdc, force_refresh=force_refresh, book=book)
     fill_estimate = estimate_fill_from_book(book, size_usdc, side=side, reference_price=signal_price)
     stale = detect_stale_liquidity(
         token_id,
@@ -304,6 +411,7 @@ def capture_trade_snapshot(
         "hours_to_resolution": round(float(hours_to_resolve), 4) if hours_to_resolve is not None else None,
         "setup_type": setup_type or None,
         "book": book,
+        "reward_context": reward_context,
         "fill_estimate": fill_estimate,
         "stale_quote": {
             "is_stale": stale.get("is_stale", False),
@@ -393,30 +501,49 @@ def get_entry_score(signal: dict, current_hour_utc: int) -> float:
 # ---------------------------------------------------------------------------
 # 6. compute_maker_price
 # ---------------------------------------------------------------------------
-def compute_maker_price(signal_price: float, side: int, spread_pct: float = 0.01) -> float:
+def compute_maker_price(
+    signal_price: float,
+    side: int,
+    spread_pct: float = 0.01,
+    book: dict | None = None,
+    reward_context: dict | None = None,
+    setup_type: str = "",
+) -> float:
     """
-    Compute limit order price for a maker (passive) order.
+    Compute a passive maker price anchored to the live book.
 
-    side: 0 = BUY, 1 = SELL
-    BUY:  limit at signal_price - spread_pct  (slightly below ask, queue up)
-    SELL: limit at signal_price + spread_pct  (slightly above bid, queue up)
-
-    Rounded to nearest 0.01.
-    Caps: BUY >= 0.02, SELL <= 0.98
+    For BUY orders, prefer sitting at best bid or improving by one tick only when
+    that still remains passive. Reward-eligible markets bias toward tighter maker
+    quotes to improve rebate capture.
     """
-    if side == 0:  # BUY
-        price = signal_price - spread_pct
-        price = max(0.02, price)
-    else:          # SELL
-        price = signal_price + spread_pct
-        price = min(0.98, price)
+    reward_context = reward_context or {}
+    tick = _coerce_float((book or {}).get("tick_size"), 0.01) or 0.01
+    best_bid = _coerce_float((book or {}).get("bid"), signal_price)
+    best_ask = _coerce_float((book or {}).get("ask"), signal_price)
+    reward_live = reward_context.get("reward_daily_rate", 0.0) > 0
 
-    return round(price, 2)
+    if side == 0:
+        target = min(signal_price - spread_pct, best_bid)
+        if setup_type == "bucket_sum_arb" or reward_live:
+            candidate = best_bid + tick
+            if best_ask <= 0 or candidate < best_ask - (tick / 2):
+                target = min(signal_price, candidate)
+            else:
+                target = min(signal_price, best_bid)
+        price = max(0.02, target)
+        price = _round_to_tick(price, tick)
+        if best_ask > 0 and price >= best_ask:
+            price = _round_to_tick(max(0.02, best_bid), tick)
+    else:
+        target = max(signal_price + spread_pct, best_ask)
+        price = min(0.98, target)
+        price = _round_to_tick(price, tick)
+        if best_bid > 0 and price <= best_bid:
+            price = _round_to_tick(min(0.98, best_ask), tick)
+
+    return round(max(0.01, min(0.99, price)), 4)
 
 
-# ---------------------------------------------------------------------------
-# 7. monitor_hk_for_entry
-# ---------------------------------------------------------------------------
 def monitor_hk_for_entry(
     signals: list,
     check_interval_minutes: int = 15,
@@ -469,6 +596,8 @@ def place_smart_order(
     spread: float = 0.03,
     hours_to_resolve: float = 24,
     setup_type: str = "",
+    reward_context: dict | None = None,
+    book_snapshot: dict | None = None,
 ) -> tuple[float, str, str]:
     """
     Determine optimal execution parameters without placing the order.
@@ -476,6 +605,8 @@ def place_smart_order(
     Returns (final_price, order_type_str, execution_notes).
     Does NOT call place_order — returns parameters for the caller to act on.
     """
+    book_snapshot = book_snapshot or get_book_snapshot(token_id)
+    reward_context = reward_context or get_reward_context(token_id, price, size_usdc, book=book_snapshot)
     stale = detect_stale_liquidity(token_id, price, side=0, hours_to_resolve=hours_to_resolve, setup_type=setup_type)
     if stale.get("is_stale"):
         final_price = stale["execution_price"]
@@ -489,16 +620,31 @@ def place_smart_order(
             notes = "[DRY_RUN] " + notes
         return final_price, order_type_str, notes
 
-    use_maker = should_use_maker(spread, hours_to_resolve)
+    use_maker = should_use_maker(spread, hours_to_resolve, setup_type=setup_type, reward_context=reward_context)
 
     if use_maker:
-        # Default to BUY side (side=0); caller adjusts if selling
-        final_price = compute_maker_price(price, side=0)
+        final_price = compute_maker_price(
+            price,
+            side=0,
+            book=book_snapshot,
+            reward_context=reward_context,
+            setup_type=setup_type,
+        )
         order_type_str = "MAKER_LIMIT"
+        reward_note = ""
+        if reward_context.get("eligible"):
+            reward_note = (
+                f" reward=${reward_context.get('reward_daily_rate', 0.0):.3f}/day"
+                f" size={reward_context.get('estimated_shares', 0.0):.2f}sh"
+            )
+            if reward_context.get("rewards_min_size"):
+                reward_note += f" vs min {reward_context['rewards_min_size']:.0f}sh"
+            if reward_context.get("spread_ok_for_rewards"):
+                reward_note += " | reward spread OK"
         notes = (
-            f"Passive limit at {final_price:.2f} "
-            f"(spread={spread:.3f}, hrs_to_resolve={hours_to_resolve:.1f}h). "
-            "Expected +2.5pp vs taker."
+            f"Passive limit at {final_price:.4f} "
+            f"(spread={spread:.3f}, hrs_to_resolve={hours_to_resolve:.1f}h, setup={setup_type or 'generic'})."
+            f"{reward_note}"
         )
     else:
         final_price = price

@@ -141,6 +141,14 @@ MAX_DAILY_EXPOSURE = _LIVE_MAX_DAILY_PCT
 RISK_FREE_RATE       = 0.0     # Sharpe calculation
 DEFAULT_MONTE_CARLO_ITERATIONS = 5000
 DEFAULT_MONTE_CARLO_SEED       = 42
+DEFAULT_MONTE_CARLO_MODE       = "block"
+DEFAULT_MONTE_CARLO_BLOCK_DAYS = 5
+DEFAULT_EXECUTION_SLIPPAGE_BPS = 15.0
+DEFAULT_EXECUTION_FEE_BPS      = 0.0
+DEFAULT_FILL_RATE              = 0.97
+DEFAULT_LOOSE_ARB_FILL_RATE    = 0.82
+DEFAULT_STALE_FILL_RATE        = 0.0
+DEFAULT_ABLATION_BOTTOM_N      = 5
 
 
 # ─── 1. FETCH BACKTEST DATA ───────────────────────────────
@@ -1002,6 +1010,279 @@ def _quantile(values: list[float], q: float):
     return round(ordered[low] + (ordered[high] - ordered[low]) * frac, 4)
 
 
+def _safe_ratio(numerator: float, denominator: float) -> float | None:
+    if denominator <= 0:
+        return None
+    return round(numerator / denominator, 4)
+
+
+def _empty_stat_bucket() -> dict:
+    return {
+        "n_bets": 0,
+        "wins": 0,
+        "total_pnl": 0.0,
+        "total_risked": 0.0,
+        "brier_sum": 0.0,
+    }
+
+
+def _update_stat_bucket(bucket: dict, trade: dict, pnl_value: float, bet_value: float) -> None:
+    bucket["n_bets"] += 1
+    bucket["wins"] += 1 if trade.get("outcome") else 0
+    bucket["total_pnl"] += pnl_value
+    bucket["total_risked"] += bet_value
+    if trade.get("brier") is not None:
+        bucket["brier_sum"] += float(trade["brier"])
+
+
+def _finalize_stat_bucket(bucket: dict) -> dict:
+    n = bucket["n_bets"]
+    return {
+        "n_bets": n,
+        "win_rate": round(bucket["wins"] / n, 4) if n else None,
+        "total_pnl": round(bucket["total_pnl"], 4),
+        "total_risked": round(bucket["total_risked"], 4),
+        "roi_on_risk": _safe_ratio(bucket["total_pnl"], bucket["total_risked"]),
+        "brier_score": round(bucket["brier_sum"] / n, 6) if n else None,
+    }
+
+
+def _aggregate_trade_breakdowns(trades: list[dict], pnl_fn=None, bet_fn=None) -> dict:
+    pnl_fn = pnl_fn or (lambda trade: float(trade.get("pnl", 0.0)))
+    bet_fn = bet_fn or (lambda trade: float(trade.get("bet", 0.0)))
+
+    strategy_stats = {}
+    strategy_arm_stats = {}
+    city_stats = {}
+    city_arm_stats = {}
+
+    for trade in trades:
+        pnl_value = float(pnl_fn(trade))
+        bet_value = float(bet_fn(trade))
+        setup = trade.get("setup_type", "unknown")
+        arm = trade.get("strategy_arm") or setup
+        city = trade.get("city", "unknown")
+        city_arm = f"{city}::{arm}"
+
+        _update_stat_bucket(strategy_stats.setdefault(setup, _empty_stat_bucket()), trade, pnl_value, bet_value)
+        _update_stat_bucket(strategy_arm_stats.setdefault(arm, _empty_stat_bucket()), trade, pnl_value, bet_value)
+        _update_stat_bucket(city_stats.setdefault(city, _empty_stat_bucket()), trade, pnl_value, bet_value)
+        _update_stat_bucket(city_arm_stats.setdefault(city_arm, _empty_stat_bucket()), trade, pnl_value, bet_value)
+
+    return {
+        "strategy_breakdown": {
+            key: _finalize_stat_bucket(bucket)
+            for key, bucket in sorted(strategy_stats.items())
+        },
+        "strategy_arm_breakdown": {
+            key: _finalize_stat_bucket(bucket)
+            for key, bucket in sorted(strategy_arm_stats.items())
+        },
+        "city_breakdown": {
+            key: _finalize_stat_bucket(bucket)
+            for key, bucket in sorted(city_stats.items())
+        },
+        "city_arm_breakdown": {
+            key: _finalize_stat_bucket(bucket)
+            for key, bucket in sorted(city_arm_stats.items())
+        },
+    }
+
+
+def _compute_path_metrics(daily_records: list[dict], starting_bankroll: float) -> tuple[float, float]:
+    daily_pnls = [float(d.get("day_pnl", 0.0)) for d in daily_records if d.get("n_trades", 0) > 0]
+    if len(daily_pnls) > 1:
+        mean_daily = statistics.mean(daily_pnls)
+        std_daily = statistics.stdev(daily_pnls)
+        sharpe = round((mean_daily - RISK_FREE_RATE) / std_daily * math.sqrt(252), 4) if std_daily > 0 else 0.0
+    else:
+        sharpe = 0.0
+
+    peak = float(starting_bankroll)
+    running = float(starting_bankroll)
+    max_dd = 0.0
+    for row in daily_records:
+        running += float(row.get("day_pnl", 0.0))
+        if running > peak:
+            peak = running
+        dd = (peak - running) / peak if peak > 0 else 0.0
+        if dd > max_dd:
+            max_dd = dd
+    return sharpe, round(max_dd, 4)
+
+
+def _build_daily_records_from_trades(trades: list[dict], starting_bankroll: float, pnl_fn=None) -> list[dict]:
+    pnl_fn = pnl_fn or (lambda trade: float(trade.get("pnl", 0.0)))
+    daily_by_date = {}
+    for trade in trades:
+        trade_date = trade.get("date")
+        if not trade_date:
+            continue
+        entry = daily_by_date.setdefault(
+            trade_date,
+            {
+                "date": trade_date,
+                "day_pnl": 0.0,
+                "n_trades": 0,
+                "cities": {},
+            },
+        )
+        pnl_value = float(pnl_fn(trade))
+        city = trade.get("city", "unknown")
+        entry["day_pnl"] += pnl_value
+        entry["n_trades"] += 1
+        city_entry = entry["cities"].setdefault(city, {"day_pnl": 0.0, "n_trades": 0})
+        city_entry["day_pnl"] += pnl_value
+        city_entry["n_trades"] += 1
+
+    bankroll = float(starting_bankroll)
+    daily_records = []
+    for trade_date in sorted(daily_by_date):
+        entry = daily_by_date[trade_date]
+        bankroll = max(0.01, bankroll + entry["day_pnl"])
+        daily_records.append(
+            {
+                "date": trade_date,
+                "day_pnl": round(entry["day_pnl"], 4),
+                "n_trades": entry["n_trades"],
+                "bankroll": round(bankroll, 4),
+                "cities": {
+                    city: {
+                        "day_pnl": round(stats["day_pnl"], 4),
+                        "n_trades": stats["n_trades"],
+                    }
+                    for city, stats in sorted(entry["cities"].items())
+                },
+            }
+        )
+    return daily_records
+
+
+def _summarize_trade_subset(
+    trades: list[dict],
+    starting_bankroll: float,
+    daily_records: list[dict] | None = None,
+    pnl_fn=None,
+    bet_fn=None,
+) -> dict:
+    pnl_fn = pnl_fn or (lambda trade: float(trade.get("pnl", 0.0)))
+    bet_fn = bet_fn or (lambda trade: float(trade.get("bet", 0.0)))
+    daily_records = daily_records or _build_daily_records_from_trades(trades, starting_bankroll, pnl_fn=pnl_fn)
+
+    total_pnl = sum(float(pnl_fn(trade)) for trade in trades)
+    total_risked = sum(float(bet_fn(trade)) for trade in trades)
+    wins = sum(1 for trade in trades if trade.get("outcome"))
+    brier_scores = [float(trade["brier"]) for trade in trades if trade.get("brier") is not None]
+    sharpe, max_dd = _compute_path_metrics(daily_records, starting_bankroll)
+    breakdowns = _aggregate_trade_breakdowns(trades, pnl_fn=pnl_fn, bet_fn=bet_fn)
+
+    return {
+        "initial_bankroll": round(starting_bankroll, 4),
+        "final_bankroll": round(starting_bankroll + total_pnl, 4),
+        "n_bets": len(trades),
+        "total_pnl": round(total_pnl, 4),
+        "total_risked": round(total_risked, 4),
+        "roi": round(total_pnl / starting_bankroll, 4) if starting_bankroll > 0 else 0.0,
+        "win_rate": round(wins / len(trades), 4) if trades else None,
+        "brier_score": round(statistics.mean(brier_scores), 6) if brier_scores else None,
+        "sharpe": sharpe,
+        "max_drawdown": max_dd,
+        "daily_records": daily_records,
+        **breakdowns,
+    }
+
+
+def _build_execution_assumptions(
+    slippage_bps: float = DEFAULT_EXECUTION_SLIPPAGE_BPS,
+    fee_bps: float = DEFAULT_EXECUTION_FEE_BPS,
+    fill_rate: float = DEFAULT_FILL_RATE,
+    loose_arb_fill_rate: float = DEFAULT_LOOSE_ARB_FILL_RATE,
+    stale_fill_rate: float = DEFAULT_STALE_FILL_RATE,
+) -> dict:
+    return {
+        "slippage_bps": max(0.0, float(slippage_bps)),
+        "fee_bps": max(0.0, float(fee_bps)),
+        "fill_rate": min(1.0, max(0.0, float(fill_rate))),
+        "loose_arb_fill_rate": min(1.0, max(0.0, float(loose_arb_fill_rate))),
+        "stale_fill_rate": min(1.0, max(0.0, float(stale_fill_rate))),
+    }
+
+
+def _fill_rate_for_trade(trade: dict, assumptions: dict) -> float:
+    arm = trade.get("strategy_arm")
+    if arm == "bucket_sum_arb_loose":
+        return min(assumptions["fill_rate"], assumptions["loose_arb_fill_rate"])
+    if arm == "stale_quote_capture":
+        return assumptions["stale_fill_rate"]
+    return assumptions["fill_rate"]
+
+
+def _trade_execution_cost(trade: dict, assumptions: dict) -> float:
+    bet = float(trade.get("bet", 0.0))
+    return bet * (assumptions["slippage_bps"] + assumptions["fee_bps"]) / 10000.0
+
+
+def _expected_adjusted_trade_pnl(trade: dict, assumptions: dict) -> float:
+    fill_rate = _fill_rate_for_trade(trade, assumptions)
+    return fill_rate * (float(trade.get("pnl", 0.0)) - _trade_execution_cost(trade, assumptions))
+
+
+def _expected_adjusted_trade_bet(trade: dict, assumptions: dict) -> float:
+    return _fill_rate_for_trade(trade, assumptions) * float(trade.get("bet", 0.0))
+
+
+def _sample_adjusted_trade_pnl(trade: dict, assumptions: dict, rng: random.Random) -> float:
+    fill_rate = _fill_rate_for_trade(trade, assumptions)
+    if rng.random() > fill_rate:
+        return 0.0
+    return float(trade.get("pnl", 0.0)) - _trade_execution_cost(trade, assumptions)
+
+
+def _trade_days_from_trades(trades: list[dict]) -> list[dict]:
+    grouped = {}
+    for trade in trades:
+        trade_date = trade.get("date")
+        if not trade_date:
+            continue
+        grouped.setdefault(trade_date, []).append(trade)
+    return [
+        {
+            "date": trade_date,
+            "trades": grouped[trade_date],
+            "n_trades": len(grouped[trade_date]),
+        }
+        for trade_date in sorted(grouped)
+    ]
+
+
+def _count_unique_cities(trades: list[dict]) -> int:
+    return len({trade.get("city") for trade in trades if trade.get("city")})
+
+
+def _scenario_starting_bankroll(trades: list[dict], fallback: float) -> float:
+    city_count = _count_unique_cities(trades)
+    if city_count <= 0:
+        return fallback
+    return round(INITIAL_BANKROLL * city_count, 4)
+
+
+def _build_execution_adjusted_summary(trades: list[dict], starting_bankroll: float, assumptions: dict) -> dict:
+    daily_records = _build_daily_records_from_trades(
+        trades,
+        starting_bankroll,
+        pnl_fn=lambda trade: _expected_adjusted_trade_pnl(trade, assumptions),
+    )
+    summary = _summarize_trade_subset(
+        trades,
+        starting_bankroll,
+        daily_records=daily_records,
+        pnl_fn=lambda trade: _expected_adjusted_trade_pnl(trade, assumptions),
+        bet_fn=lambda trade: _expected_adjusted_trade_bet(trade, assumptions),
+    )
+    summary["execution_assumptions"] = assumptions
+    return summary
+
+
 def _slim_backtest_results(results):
     if not isinstance(results, dict):
         return results
@@ -1101,13 +1382,14 @@ def run_multi_city_backtest(cities: list[str], days: int = 180, coeffs=None) -> 
             for key, value in values.items():
                 target[key] = target.get(key, 0) + value
 
-    total_pnl = round(sum(r.get("total_pnl", 0.0) for r in city_results.values()), 4)
-    total_risked = round(sum(r.get("total_risked", 0.0) for r in city_results.values()), 4)
-    wins = sum(1 for trade in all_trades if trade.get("outcome"))
-    brier_scores = [trade["brier"] for trade in all_trades if trade.get("brier") is not None]
     active_cities = sum(1 for r in city_results.values() if r.get("n_bets", 0) > 0)
     sample_result = next(iter(city_results.values()))
     initial_bankroll = round(INITIAL_BANKROLL * len(city_results), 4)
+    summary = _summarize_trade_subset(
+        trades=all_trades,
+        starting_bankroll=initial_bankroll,
+        daily_records=portfolio_daily,
+    )
 
     return {
         "mode": "multi_city",
@@ -1120,15 +1402,22 @@ def run_multi_city_backtest(cities: list[str], days: int = 180, coeffs=None) -> 
         "end_date": sample_result.get("end_date"),
         "n_days": sample_result.get("n_days"),
         "portfolio_daily_records": portfolio_daily,
-        "initial_bankroll": initial_bankroll,
-        "final_bankroll": round(initial_bankroll + total_pnl, 4),
-        "n_bets": len(all_trades),
-        "total_pnl": total_pnl,
-        "total_risked": total_risked,
-        "roi": round(total_pnl / initial_bankroll, 4) if initial_bankroll > 0 else 0.0,
-        "win_rate": round(wins / len(all_trades), 4) if all_trades else None,
-        "brier_score": round(statistics.mean(brier_scores), 6) if brier_scores else None,
+        "initial_bankroll": summary["initial_bankroll"],
+        "final_bankroll": summary["final_bankroll"],
+        "n_bets": summary["n_bets"],
+        "total_pnl": summary["total_pnl"],
+        "total_risked": summary["total_risked"],
+        "roi": summary["roi"],
+        "win_rate": summary["win_rate"],
+        "brier_score": summary["brier_score"],
+        "sharpe": summary["sharpe"],
+        "max_drawdown": summary["max_drawdown"],
+        "strategy_breakdown": summary["strategy_breakdown"],
+        "strategy_arm_breakdown": summary["strategy_arm_breakdown"],
+        "city_breakdown": summary["city_breakdown"],
+        "city_arm_breakdown": summary["city_arm_breakdown"],
         "diagnostics": diagnostics,
+        "all_trades": all_trades,
         "computed_at": date.today().isoformat(),
     }
 
@@ -1136,16 +1425,67 @@ def run_multi_city_backtest(cities: list[str], days: int = 180, coeffs=None) -> 
 def run_monte_carlo(
     daily_records: list[dict],
     starting_bankroll: float,
+    all_trades: list[dict] | None = None,
     iterations: int = DEFAULT_MONTE_CARLO_ITERATIONS,
     horizon_days: int | None = None,
     seed: int = DEFAULT_MONTE_CARLO_SEED,
+    mode: str = DEFAULT_MONTE_CARLO_MODE,
+    block_days: int = DEFAULT_MONTE_CARLO_BLOCK_DAYS,
+    slippage_bps: float = DEFAULT_EXECUTION_SLIPPAGE_BPS,
+    fee_bps: float = DEFAULT_EXECUTION_FEE_BPS,
+    fill_rate: float = DEFAULT_FILL_RATE,
+    loose_arb_fill_rate: float = DEFAULT_LOOSE_ARB_FILL_RATE,
+    stale_fill_rate: float = DEFAULT_STALE_FILL_RATE,
 ) -> dict:
-    if not daily_records:
+    if not daily_records and not all_trades:
         return {"error": "no_daily_records"}
 
-    pnl_samples = [float(row.get("day_pnl", 0.0)) for row in daily_records]
-    horizon = horizon_days or len(pnl_samples)
+    assumptions = _build_execution_assumptions(
+        slippage_bps=slippage_bps,
+        fee_bps=fee_bps,
+        fill_rate=fill_rate,
+        loose_arb_fill_rate=loose_arb_fill_rate,
+        stale_fill_rate=stale_fill_rate,
+    )
+    mode = (mode or DEFAULT_MONTE_CARLO_MODE).strip().lower()
+    if mode not in {"daily", "trade", "block"}:
+        return {"error": "invalid_mode", "mode": mode}
+
+    trade_days = _trade_days_from_trades(all_trades or [])
+    sample_days = len(daily_records) or len(trade_days)
+    if sample_days <= 0:
+        return {"error": "no_daily_records"}
+    horizon = horizon_days or sample_days
     rng = random.Random(seed)
+
+    adjusted_daily_records = _build_daily_records_from_trades(
+        all_trades or [],
+        starting_bankroll,
+        pnl_fn=lambda trade: _expected_adjusted_trade_pnl(trade, assumptions),
+    ) if all_trades else daily_records
+    adjusted_pnl_samples = [float(row.get("day_pnl", 0.0)) for row in adjusted_daily_records]
+    if not adjusted_pnl_samples:
+        adjusted_pnl_samples = [float(row.get("day_pnl", 0.0)) for row in daily_records]
+
+    trade_pool = list(all_trades or [])
+    day_trade_counts = [day["n_trades"] for day in trade_days if day.get("n_trades", 0) > 0]
+    synthetic_days = [{"day_pnl": float(row.get("day_pnl", 0.0)), "n_trades": int(row.get("n_trades", 0)), "trades": []} for row in daily_records]
+    day_pool = trade_days if trade_days else synthetic_days
+    if not day_pool:
+        return {"error": "no_daily_records"}
+
+    if mode == "trade" and not trade_pool:
+        return {"error": "no_trade_data_for_trade_mode"}
+
+    if mode == "block":
+        block_size = max(1, int(block_days or DEFAULT_MONTE_CARLO_BLOCK_DAYS))
+        if len(day_pool) <= block_size:
+            blocks = [day_pool]
+        else:
+            blocks = [day_pool[start:start + block_size] for start in range(0, len(day_pool) - block_size + 1)]
+    else:
+        block_size = 1
+        blocks = []
 
     terminal_bankrolls = []
     max_drawdowns = []
@@ -1157,12 +1497,48 @@ def run_monte_carlo(
         bankroll = float(starting_bankroll)
         peak = bankroll
         max_dd = 0.0
+        simulated_days = 0
 
-        for _day in range(horizon):
-            bankroll = max(0.01, bankroll + rng.choice(pnl_samples))
-            peak = max(peak, bankroll)
-            if peak > 0:
-                max_dd = max(max_dd, (peak - bankroll) / peak)
+        while simulated_days < horizon:
+            if mode == "trade":
+                trade_count = rng.choice(day_trade_counts) if day_trade_counts else 0
+                day_pnl = 0.0
+                for _trade in range(trade_count):
+                    sampled_trade = rng.choice(trade_pool)
+                    day_pnl += _sample_adjusted_trade_pnl(sampled_trade, assumptions, rng)
+                bankroll = max(0.01, bankroll + day_pnl)
+                peak = max(peak, bankroll)
+                if peak > 0:
+                    max_dd = max(max_dd, (peak - bankroll) / peak)
+                simulated_days += 1
+                continue
+
+            if mode == "daily":
+                sampled_day = rng.choice(day_pool)
+                if sampled_day.get("trades"):
+                    day_pnl = sum(_sample_adjusted_trade_pnl(trade, assumptions, rng) for trade in sampled_day["trades"])
+                else:
+                    day_pnl = float(sampled_day.get("day_pnl", 0.0))
+                bankroll = max(0.01, bankroll + day_pnl)
+                peak = max(peak, bankroll)
+                if peak > 0:
+                    max_dd = max(max_dd, (peak - bankroll) / peak)
+                simulated_days += 1
+                continue
+
+            sampled_block = rng.choice(blocks)
+            for sampled_day in sampled_block:
+                if simulated_days >= horizon:
+                    break
+                if sampled_day.get("trades"):
+                    day_pnl = sum(_sample_adjusted_trade_pnl(trade, assumptions, rng) for trade in sampled_day["trades"])
+                else:
+                    day_pnl = float(sampled_day.get("day_pnl", 0.0))
+                bankroll = max(0.01, bankroll + day_pnl)
+                peak = max(peak, bankroll)
+                if peak > 0:
+                    max_dd = max(max_dd, (peak - bankroll) / peak)
+                simulated_days += 1
 
         terminal_bankrolls.append(bankroll)
         max_drawdowns.append(max_dd)
@@ -1173,11 +1549,14 @@ def run_monte_carlo(
     return {
         "iterations": iterations,
         "seed": seed,
-        "sample_days": len(pnl_samples),
+        "mode": mode,
+        "block_days": block_size if mode == "block" else None,
+        "sample_days": sample_days,
+        "sample_trades": len(trade_pool),
         "horizon_days": horizon,
         "starting_bankroll": round(starting_bankroll, 4),
-        "mean_daily_pnl": round(statistics.mean(pnl_samples), 6),
-        "stdev_daily_pnl": round(statistics.stdev(pnl_samples), 6) if len(pnl_samples) > 1 else 0.0,
+        "mean_daily_pnl": round(statistics.mean(adjusted_pnl_samples), 6),
+        "stdev_daily_pnl": round(statistics.stdev(adjusted_pnl_samples), 6) if len(adjusted_pnl_samples) > 1 else 0.0,
         "mean_terminal_bankroll": round(statistics.mean(terminal_bankrolls), 4),
         "median_terminal_bankroll": _quantile(terminal_bankrolls, 0.5),
         "p05_terminal_bankroll": _quantile(terminal_bankrolls, 0.05),
@@ -1192,7 +1571,109 @@ def run_monte_carlo(
         "prob_bust": round(busts / iterations, 4),
         "mean_max_drawdown": round(statistics.mean(max_drawdowns), 4),
         "p95_max_drawdown": _quantile(max_drawdowns, 0.95),
+        "execution_assumptions": assumptions,
     }
+
+
+def run_ablation_study(
+    results: dict,
+    mc_iterations: int,
+    mc_horizon_days: int | None,
+    seed: int,
+    mc_mode: str,
+    mc_block_days: int,
+    slippage_bps: float,
+    fee_bps: float,
+    fill_rate: float,
+    loose_arb_fill_rate: float,
+    stale_fill_rate: float,
+) -> list[dict]:
+    all_trades = list(results.get("all_trades") or [])
+    if not all_trades:
+        return []
+
+    assumptions = _build_execution_assumptions(
+        slippage_bps=slippage_bps,
+        fee_bps=fee_bps,
+        fill_rate=fill_rate,
+        loose_arb_fill_rate=loose_arb_fill_rate,
+        stale_fill_rate=stale_fill_rate,
+    )
+    city_breakdown = results.get("city_breakdown") or _aggregate_trade_breakdowns(all_trades).get("city_breakdown", {})
+    sorted_cities = sorted(city_breakdown.items(), key=lambda item: item[1].get("total_pnl", 0.0))
+    bottom_cities = [city for city, _stats in sorted_cities[:DEFAULT_ABLATION_BOTTOM_N]]
+    positive_cities = [city for city, stats in city_breakdown.items() if stats.get("total_pnl", 0.0) > 0]
+
+    scenarios = [
+        {
+            "name": "baseline_all",
+            "label": "All executed trades",
+            "trades": all_trades,
+            "starting_bankroll": results.get("initial_bankroll", _scenario_starting_bankroll(all_trades, INITIAL_BANKROLL)),
+        },
+        {
+            "name": "no_bucket_sum_arb_loose",
+            "label": "Exclude bucket_sum_arb_loose",
+            "trades": [trade for trade in all_trades if trade.get("strategy_arm") != "bucket_sum_arb_loose"],
+            "starting_bankroll": results.get("initial_bankroll", _scenario_starting_bankroll(all_trades, INITIAL_BANKROLL)),
+        },
+        {
+            "name": "precision_only",
+            "label": "Precision arms only",
+            "trades": [trade for trade in all_trades if str(trade.get("strategy_arm", "")).startswith("precision_")],
+            "starting_bankroll": results.get("initial_bankroll", _scenario_starting_bankroll(all_trades, INITIAL_BANKROLL)),
+        },
+        {
+            "name": "positive_cities_only",
+            "label": "Positive-PnL cities only",
+            "trades": [trade for trade in all_trades if trade.get("city") in positive_cities],
+            "starting_bankroll": round(INITIAL_BANKROLL * len(positive_cities), 4) if positive_cities else results.get("initial_bankroll", INITIAL_BANKROLL),
+            "selected_cities": positive_cities,
+        },
+        {
+            "name": "drop_bottom_5_cities",
+            "label": "Drop worst 5 cities",
+            "trades": [trade for trade in all_trades if trade.get("city") not in bottom_cities],
+            "starting_bankroll": round(INITIAL_BANKROLL * max(results.get("n_cities", 0) - len(bottom_cities), 1), 4),
+            "excluded_cities": bottom_cities,
+        },
+    ]
+
+    outputs = []
+    for scenario in scenarios:
+        trades = scenario["trades"]
+        starting_bankroll = float(scenario["starting_bankroll"])
+        raw_summary = _summarize_trade_subset(trades, starting_bankroll)
+        execution_adjusted = _build_execution_adjusted_summary(trades, starting_bankroll, assumptions)
+        monte_carlo = run_monte_carlo(
+            daily_records=raw_summary["daily_records"],
+            starting_bankroll=starting_bankroll,
+            all_trades=trades,
+            iterations=mc_iterations,
+            horizon_days=mc_horizon_days,
+            seed=seed,
+            mode=mc_mode,
+            block_days=mc_block_days,
+            slippage_bps=slippage_bps,
+            fee_bps=fee_bps,
+            fill_rate=fill_rate,
+            loose_arb_fill_rate=loose_arb_fill_rate,
+            stale_fill_rate=stale_fill_rate,
+        )
+        outputs.append(
+            {
+                "name": scenario["name"],
+                "label": scenario["label"],
+                "n_cities": _count_unique_cities(trades),
+                "n_bets": len(trades),
+                "selected_cities": scenario.get("selected_cities"),
+                "excluded_cities": scenario.get("excluded_cities"),
+                "raw": _slim_backtest_results(raw_summary),
+                "execution_adjusted": _slim_backtest_results(execution_adjusted),
+                "monte_carlo": monte_carlo,
+            }
+        )
+    return outputs
 
 
 def print_multi_city_backtest_report(results: dict) -> None:
@@ -1212,6 +1693,8 @@ def print_multi_city_backtest_report(results: dict) -> None:
     print(f"  Final roll:     ${results.get('final_bankroll', 0.0):.2f}", flush=True)
     print(f"  Total PnL:      ${results.get('total_pnl', 0.0):+.4f}", flush=True)
     print(f"  ROI:            {results.get('roi', 0.0):+.1%}", flush=True)
+    print(f"  Sharpe (ann.):  {results.get('sharpe', 0.0):.2f}", flush=True)
+    print(f"  Max drawdown:   {results.get('max_drawdown', 0.0):.1%}", flush=True)
     win_rate = results.get("win_rate")
     brier = results.get("brier_score")
     print(f"  Win rate:       {win_rate:.1%}" if win_rate is not None else "  Win rate:       N/A", flush=True)
@@ -1225,6 +1708,19 @@ def print_multi_city_backtest_report(results: dict) -> None:
         results.get("city_results", {}).items(),
         key=lambda item: (-item[1].get("n_bets", 0), item[0]),
     )
+
+    strategy_arm_bd = results.get("strategy_arm_breakdown", {})
+    if strategy_arm_bd:
+        print(flush=True)
+        print("  PORTFOLIO STRATEGY-ARM SUMMARY:", flush=True)
+        print(f"  {'Arm':>22s}  {'N':>5s}  {'PnL':>8s}  {'ROI/Risk':>10s}", flush=True)
+        print("  " + "-" * 56, flush=True)
+        for label, s in sorted(strategy_arm_bd.items(), key=lambda item: item[1].get("total_pnl", 0.0), reverse=True):
+            rr_str = f"{s['roi_on_risk']:+.1%}" if s["roi_on_risk"] is not None else "  N/A"
+            print(
+                f"  {label:>22s}  {s['n_bets']:>5d}  ${s['total_pnl']:>+7.4f}  {rr_str:>10s}",
+                flush=True,
+            )
     active_rows = [(city, stats) for city, stats in ranked if stats.get("n_bets", 0) > 0]
     if active_rows:
         print(flush=True)
@@ -1253,13 +1749,32 @@ def print_monte_carlo_report(results: dict) -> None:
     if results.get("error") == "no_daily_records":
         print("  ERROR: no daily records available for Monte Carlo simulation.", flush=True)
         return
+    if results.get("error") == "no_trade_data_for_trade_mode":
+        print("  ERROR: trade mode requires trade-level data.", flush=True)
+        return
 
     print(f"  Iterations:          {results.get('iterations', 0)}", flush=True)
+    print(f"  Mode:                {results.get('mode', 'unknown')}", flush=True)
+    if results.get('mode') == 'block':
+        print(f"  Block size:          {results.get('block_days', 0)} days", flush=True)
     print(f"  Horizon:             {results.get('horizon_days', 0)} days", flush=True)
     print(f"  Sample days:         {results.get('sample_days', 0)}", flush=True)
+    print(f"  Sample trades:       {results.get('sample_trades', 0)}", flush=True)
     print(f"  Starting bankroll:   ${results.get('starting_bankroll', 0.0):.2f}", flush=True)
     print(f"  Mean daily PnL:      ${results.get('mean_daily_pnl', 0.0):+.4f}", flush=True)
     print(f"  Daily PnL stdev:     ${results.get('stdev_daily_pnl', 0.0):.4f}", flush=True)
+    assumptions = results.get('execution_assumptions') or {}
+    if assumptions:
+        print(flush=True)
+        print("  EXECUTION ASSUMPTIONS:", flush=True)
+        print(
+            f"    Slippage+fees:     {assumptions.get('slippage_bps', 0.0) + assumptions.get('fee_bps', 0.0):.1f} bps"
+            f"  (slippage {assumptions.get('slippage_bps', 0.0):.1f} + fees {assumptions.get('fee_bps', 0.0):.1f})",
+            flush=True,
+        )
+        print(f"    Base fill rate:    {assumptions.get('fill_rate', 0.0):.1%}", flush=True)
+        print(f"    Loose-arb fill:    {assumptions.get('loose_arb_fill_rate', 0.0):.1%}", flush=True)
+        print(f"    Stale fill rate:   {assumptions.get('stale_fill_rate', 0.0):.1%}", flush=True)
     print(flush=True)
     print("  TERMINAL BANKROLL DISTRIBUTION:", flush=True)
     print(f"    Mean:              ${results.get('mean_terminal_bankroll', 0.0):.4f}", flush=True)
@@ -1276,15 +1791,49 @@ def print_monte_carlo_report(results: dict) -> None:
     print(f"    P95 max DD:        {results.get('p95_max_drawdown', 0.0):.1%}", flush=True)
 
 
+def print_ablation_report(ablation_results: list[dict]) -> None:
+    if not ablation_results:
+        return
+
+    print("\n" + "=" * 70, flush=True)
+    print("ABLATION STUDY", flush=True)
+    print("=" * 70, flush=True)
+    print(f"  {'Scenario':<28s} {'Bets':>6s} {'Raw ROI':>9s} {'Adj ROI':>9s} {'MC P05':>10s} {'MC Profit%':>11s}", flush=True)
+    print("  " + "-" * 86, flush=True)
+    for row in ablation_results:
+        raw = row.get('raw', {})
+        adjusted = row.get('execution_adjusted', {})
+        mc = row.get('monte_carlo', {})
+        print(
+            f"  {row.get('name', 'unknown'):<28s} {raw.get('n_bets', 0):>6d} "
+            f"{raw.get('roi', 0.0):>+8.1%} {adjusted.get('roi', 0.0):>+8.1%} "
+            f"${mc.get('p05_terminal_bankroll', 0.0):>9.2f} {mc.get('prob_profit', 0.0):>10.1%}",
+            flush=True,
+        )
+        if row.get('excluded_cities'):
+            print(f"    excluded: {', '.join(row['excluded_cities'])}", flush=True)
+        if row.get('selected_cities'):
+            selected = row['selected_cities']
+            print(f"    selected: {', '.join(selected[:12])}" + (" ..." if len(selected) > 12 else ""), flush=True)
+
+
 def _parse_args():
     parser = argparse.ArgumentParser(description="Backtest Polymarket weather strategies and run Monte Carlo simulations.")
     parser.add_argument("--city", default="hong kong", help="single city to backtest")
     parser.add_argument("--cities", default="", help="comma-separated city list for a portfolio backtest")
     parser.add_argument("--all-cities", action="store_true", help="backtest every city with EMOS coefficients")
     parser.add_argument("--days", type=int, default=180, help="historical lookback window")
-    parser.add_argument("--monte-carlo", action="store_true", help="run bootstrap Monte Carlo on the resulting daily PnL stream")
+    parser.add_argument("--monte-carlo", action="store_true", help="run Monte Carlo on the resulting trade stream")
     parser.add_argument("--mc-iterations", type=int, default=DEFAULT_MONTE_CARLO_ITERATIONS, help="number of Monte Carlo paths")
     parser.add_argument("--mc-horizon-days", type=int, default=0, help="simulation horizon in days; 0 uses the sample length")
+    parser.add_argument("--mc-mode", choices=["daily", "trade", "block"], default=DEFAULT_MONTE_CARLO_MODE, help="Monte Carlo resampling mode")
+    parser.add_argument("--mc-block-days", type=int, default=DEFAULT_MONTE_CARLO_BLOCK_DAYS, help="block length for block-bootstrap Monte Carlo")
+    parser.add_argument("--execution-slippage-bps", type=float, default=DEFAULT_EXECUTION_SLIPPAGE_BPS, help="per-trade slippage haircut in bps")
+    parser.add_argument("--execution-fee-bps", type=float, default=DEFAULT_EXECUTION_FEE_BPS, help="per-trade fee haircut in bps")
+    parser.add_argument("--fill-rate", type=float, default=DEFAULT_FILL_RATE, help="base fill rate for simulated execution")
+    parser.add_argument("--loose-arb-fill-rate", type=float, default=DEFAULT_LOOSE_ARB_FILL_RATE, help="fill rate override for bucket_sum_arb_loose")
+    parser.add_argument("--stale-fill-rate", type=float, default=DEFAULT_STALE_FILL_RATE, help="fill rate override for stale quote capture")
+    parser.add_argument("--ablation", action="store_true", help="run post-backtest ablation study on realized trades")
     parser.add_argument("--seed", type=int, default=DEFAULT_MONTE_CARLO_SEED, help="RNG seed for Monte Carlo")
     return parser.parse_args()
 
@@ -1535,11 +2084,36 @@ def main():
         monte_carlo = run_monte_carlo(
             daily_records=daily_records,
             starting_bankroll=starting_bankroll,
+            all_trades=results.get("all_trades", []),
             iterations=max(1, args.mc_iterations),
             horizon_days=args.mc_horizon_days or None,
             seed=args.seed,
+            mode=args.mc_mode,
+            block_days=max(1, args.mc_block_days),
+            slippage_bps=args.execution_slippage_bps,
+            fee_bps=args.execution_fee_bps,
+            fill_rate=args.fill_rate,
+            loose_arb_fill_rate=args.loose_arb_fill_rate,
+            stale_fill_rate=args.stale_fill_rate,
         )
         print_monte_carlo_report(monte_carlo)
+
+    ablation = []
+    if args.ablation:
+        ablation = run_ablation_study(
+            results=results,
+            mc_iterations=max(500, min(args.mc_iterations, 5000)),
+            mc_horizon_days=args.mc_horizon_days or None,
+            seed=args.seed,
+            mc_mode=args.mc_mode,
+            mc_block_days=max(1, args.mc_block_days),
+            slippage_bps=args.execution_slippage_bps,
+            fee_bps=args.execution_fee_bps,
+            fill_rate=args.fill_rate,
+            loose_arb_fill_rate=args.loose_arb_fill_rate,
+            stale_fill_rate=args.stale_fill_rate,
+        )
+        print_ablation_report(ablation)
 
     out_path = os.path.join(_SCRIPT_DIR, "backtest_results.json")
     payload = {
@@ -1548,6 +2122,8 @@ def main():
     }
     if monte_carlo is not None:
         payload["monte_carlo"] = monte_carlo
+    if ablation:
+        payload["ablation"] = ablation
     with open(out_path, "w") as f:
         json.dump(payload, f, indent=2)
     print(f"\n[backtest] Results saved → {out_path}", flush=True)
