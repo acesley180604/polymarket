@@ -6,10 +6,10 @@ Reports: PnL, Brier score, calibration, Kelly sizing performance.
 Run: python3 polymarket_backtest.py
 """
 
-import os, json, time, math, statistics
+import argparse, os, json, time, math, random, statistics
 import requests
 from datetime import date, timedelta
-from polymarket_core import f_to_c, c_to_f
+from polymarket_core import CITY_COORDS, f_to_c, c_to_f
 from polymarket_model import (
     get_tier as live_get_tier,
     kelly_size as live_kelly_size,
@@ -36,6 +36,75 @@ HK_BUCKETS_F = [
     (89.6,  999.0),    # >32°C  (≥89.6°F)
 ]
 
+
+# ─── CITY BUCKET FETCHING ─────────────────────────────────
+
+def fetch_city_buckets_f(city: str) -> list:
+    """
+    Fetch real bucket structure for a city from Polymarket Gamma API.
+    Returns list of (low_f, high_f) tuples representing the most recent
+    complete daily market set for that city.
+    Falls back to HK_BUCKETS_F only if API fails.
+    """
+    from polymarket_core import GAMMA_API, detect_city, parse_temp_range, c_to_f
+
+    city_l = city.strip().lower()
+    date_buckets = {}
+
+    try:
+        for offset in range(3300, 3600, 100):
+            r = requests.get(
+                f"{GAMMA_API}/events",
+                params={"tag_slug": "weather", "active": "true", "limit": 100, "offset": offset},
+                timeout=15,
+            )
+            events = r.json() if isinstance(r.json(), list) else []
+            if not events:
+                break
+            for ev in events:
+                end_day = ev.get("endDate", "")[:10]
+                if not end_day:
+                    continue
+                for mkt in ev.get("markets", []):
+                    q = mkt.get("question", "")
+                    detected, _ = detect_city(q)
+                    if detected != city_l:
+                        continue
+                    parsed = parse_temp_range(q)
+                    if not parsed:
+                        continue
+                    low, high, unit = parsed
+                    if unit == "C":
+                        low_f  = c_to_f(low)  if low  > -999.0 else -999.0
+                        high_f = c_to_f(high) if high < 999.0  else  999.0
+                    else:
+                        low_f, high_f = float(low), float(high)
+                    low_f  = round(low_f, 1)
+                    high_f = round(high_f, 1)
+                    date_buckets.setdefault(end_day, set()).add((low_f, high_f))
+    except Exception as e:
+        print(f"  [buckets] Gamma fetch failed for {city}: {e}", flush=True)
+
+    if not date_buckets:
+        print(f"  [buckets] No markets found for {city}, using HK_BUCKETS_F fallback", flush=True)
+        return list(HK_BUCKETS_F)
+
+    # Pick the most recent date with the largest complete market set (>= 3 buckets)
+    best_day, best_buckets = None, []
+    for day in sorted(date_buckets.keys(), reverse=True):
+        bkts = sorted(date_buckets[day])
+        if len(bkts) >= 3:
+            best_day, best_buckets = day, bkts
+            break
+
+    if not best_buckets:
+        print(f"  [buckets] No complete set for {city}, using HK_BUCKETS_F fallback", flush=True)
+        return list(HK_BUCKETS_F)
+
+    print(f"  [buckets] {city.title()}: {len(best_buckets)} buckets from {best_day}", flush=True)
+    return best_buckets
+
+
 TAIL_MIN_PRICE       = 0.01    # match live extreme-tail zone
 TAIL_MAX_PRICE       = 0.05
 TAIL_RATIO_THRESH    = 2.0
@@ -44,11 +113,34 @@ ARB_LOOSE_MIN_DEVIATION = 0.08 # match live loose-arb promotion threshold
 ARB_BET_PER_LEG      = 0.50
 ENTRY_PRICE_CAP      = 0.72    # match live directional cap
 STANDARD_MIN_EDGE    = 0.12    # live-ish proxy since historical market quotes are unavailable
-INITIAL_BANKROLL     = 2.0     # $2 USDC paper bankroll
-MAX_BET              = 0.30    # match live T1 cap
 RAW_SIGNAL_MIN_BET   = 0.50    # live model gate before autotrader cap
-MAX_DAILY_EXPOSURE   = ACCOUNT_TIERS[1]["max_daily_pct"]
+
+# ─── LIVE CONFIG FROM ENV ───────────────────────────────────
+def _load_live_capital():
+    """Read BANKROLL_OVERRIDE and TIER from polymarket.env to scale backtest realistically."""
+    from polymarket_core import ENV as _env
+    from polymarket_capital import TIERS as _CTIERS
+    try:
+        bankroll = float(_env.get("BANKROLL_OVERRIDE") or 0)
+    except (TypeError, ValueError):
+        bankroll = 0
+    try:
+        tier_num = int(_env.get("TIER") or 1)
+    except (TypeError, ValueError):
+        tier_num = 1
+    if bankroll <= 0:
+        bankroll = 2.0
+        tier_num = 1
+    tier_cfg = _CTIERS.get(tier_num, _CTIERS[1])
+    return bankroll, tier_cfg["max_bet"], _CTIERS[tier_num]["max_daily_pct"]
+
+_LIVE_BANKROLL, _LIVE_MAX_BET, _LIVE_MAX_DAILY_PCT = _load_live_capital()
+INITIAL_BANKROLL  = _LIVE_BANKROLL
+MAX_BET           = _LIVE_MAX_BET
+MAX_DAILY_EXPOSURE = _LIVE_MAX_DAILY_PCT
 RISK_FREE_RATE       = 0.0     # Sharpe calculation
+DEFAULT_MONTE_CARLO_ITERATIONS = 5000
+DEFAULT_MONTE_CARLO_SEED       = 42
 
 
 # ─── 1. FETCH BACKTEST DATA ───────────────────────────────
@@ -150,7 +242,10 @@ def fetch_backtest_data(city: str, lat: float, lon: float,
 def _bucket_outcome(actual_c: float, low_f: float, high_f: float) -> bool:
     low_c  = f_to_c(low_f)  if low_f  > -999.0 else -999.0
     high_c = f_to_c(high_f) if high_f <  999.0  else  999.0
-
+    # Exact-degree market: round actual to nearest 0.5°C
+    if abs(low_c - high_c) < 0.05 and low_c > -999.0 and high_c < 999.0:
+        low_c  = low_c  - 0.5
+        high_c = high_c + 0.5
     if low_c <= -999.0:
         return actual_c <= high_c
     if high_c >= 999.0:
@@ -215,6 +310,10 @@ def _bucket_probability(mu: float, sigma: float, low_f: float, high_f: float,
                         emos_mod=None) -> float:
     low_c  = f_to_c(low_f)  if low_f  > -999.0 else -999.0
     high_c = f_to_c(high_f) if high_f <  999.0  else  999.0
+    # Exact-degree market: "be exactly X°C" → expand to ±0.5°C window
+    if abs(low_c - high_c) < 0.05 and low_c > -999.0 and high_c < 999.0:
+        low_c  = low_c  - 0.5
+        high_c = high_c + 0.5
     if emos_mod is not None:
         return emos_mod.prob_bucket(mu, sigma, low_c, high_c)
 
@@ -300,7 +399,8 @@ def run_backtest(city: str = "hong kong",
                  lat: float = 22.3020,
                  lon: float = 114.1739,
                  days: int = 180,
-                 coeffs=None) -> dict:
+                 coeffs=None,
+                 buckets_f=None) -> dict:
     """
     Full 180-day backtest for HK weather markets.
     Uses EMOS Gaussian CDF for probability estimation when coefficients
@@ -328,6 +428,10 @@ def run_backtest(city: str = "hong kong",
         except Exception:
             coeffs = {}
 
+    # Use caller-supplied buckets or fetch from Gamma API
+    if buckets_f is None:
+        buckets_f = fetch_city_buckets_f(city)
+
     hk_coeffs  = coeffs.get(city, coeffs.get("hong kong"))
     if isinstance(hk_coeffs, dict) and "12-24" in hk_coeffs:
         hk_coeffs = hk_coeffs["12-24"]
@@ -345,7 +449,7 @@ def run_backtest(city: str = "hong kong",
     daily_records  = []
     all_trades     = []
     bucket_stats   = {i: {"n": 0, "wins": 0, "pnl": 0.0, "brier_sum": 0.0}
-                      for i in range(len(HK_BUCKETS_F))}
+                      for i in range(len(buckets_f))}
     diagnostics = {
         "directional_rejects": {},
         "arb_rejects": {},
@@ -391,9 +495,9 @@ def run_backtest(city: str = "hong kong",
         day_candidates = []
         market_features = []
         yesterday_actual = daily_records[-1]["actual_c"] if daily_records else None
-        proxy_prices = _proxy_bucket_prices(raw_mean, raw_std, HK_BUCKETS_F)
+        proxy_prices = _proxy_bucket_prices(raw_mean, raw_std, buckets_f)
 
-        for i, (low_f, high_f) in enumerate(HK_BUCKETS_F):
+        for i, (low_f, high_f) in enumerate(buckets_f):
             model_prob = _bucket_probability(
                 mu, sigma, low_f, high_f, emos_mod if _has_emos else None
             )
@@ -696,7 +800,7 @@ def run_backtest(city: str = "hong kong",
             day_pnl   += result["pnl"]
             day_trades += 1
 
-            trade_rec = {"date": rec["date"], **candidate, **result}
+            trade_rec = {"date": rec["date"], "city": city, **candidate, **result}
             all_trades.append(trade_rec)
 
             s = bucket_stats[candidate["bucket_idx"]]
@@ -707,6 +811,7 @@ def run_backtest(city: str = "hong kong",
 
         daily_records.append({
             "date":      rec["date"],
+            "city":      city,
             "actual_c":  actual_c,
             "mu":        round(mu, 2),
             "sigma":     round(sigma, 2),
@@ -773,7 +878,7 @@ def run_backtest(city: str = "hong kong",
 
     # Per-bucket breakdown
     bucket_breakdown = {}
-    for i, (low_f, high_f) in enumerate(HK_BUCKETS_F):
+    for i, (low_f, high_f) in enumerate(buckets_f):
         s = bucket_stats[i]
         if s["n"] == 0:
             continue
@@ -872,6 +977,339 @@ def run_backtest(city: str = "hong kong",
         "all_trades":       all_trades,
         "computed_at":      date.today().isoformat(),
     }
+
+
+def _canonical_city(city: str) -> str:
+    city_slug = (city or "").strip().lower()
+    return {
+        "new york": "new york city",
+        "nyc": "new york city",
+    }.get(city_slug, city_slug)
+
+
+def _quantile(values: list[float], q: float):
+    if not values:
+        return None
+    ordered = sorted(float(v) for v in values)
+    if len(ordered) == 1:
+        return round(ordered[0], 4)
+    pos = (len(ordered) - 1) * q
+    low = math.floor(pos)
+    high = math.ceil(pos)
+    if low == high:
+        return round(ordered[low], 4)
+    frac = pos - low
+    return round(ordered[low] + (ordered[high] - ordered[low]) * frac, 4)
+
+
+def _slim_backtest_results(results):
+    if not isinstance(results, dict):
+        return results
+    slim = {}
+    for key, value in results.items():
+        if key == "all_trades":
+            continue
+        if key == "city_results" and isinstance(value, dict):
+            slim[key] = {
+                city: _slim_backtest_results(city_result)
+                for city, city_result in value.items()
+            }
+        else:
+            slim[key] = value
+    return slim
+
+
+def _build_portfolio_daily_records(city_results: dict) -> list[dict]:
+    daily_by_date = {}
+    for city, results in city_results.items():
+        for row in results.get("daily_records", []):
+            entry = daily_by_date.setdefault(
+                row["date"],
+                {
+                    "date": row["date"],
+                    "day_pnl": 0.0,
+                    "n_trades": 0,
+                    "cities": {},
+                },
+            )
+            entry["day_pnl"] += row.get("day_pnl", 0.0)
+            entry["n_trades"] += row.get("n_trades", 0)
+            entry["cities"][city] = {
+                "day_pnl": row.get("day_pnl", 0.0),
+                "n_trades": row.get("n_trades", 0),
+                "bankroll": row.get("bankroll"),
+            }
+
+    bankroll = INITIAL_BANKROLL * len(city_results)
+    portfolio_daily = []
+    for day in sorted(daily_by_date):
+        entry = daily_by_date[day]
+        bankroll = max(0.01, bankroll + entry["day_pnl"])
+        portfolio_daily.append({
+            "date": entry["date"],
+            "day_pnl": round(entry["day_pnl"], 4),
+            "n_trades": entry["n_trades"],
+            "bankroll": round(bankroll, 4),
+            "cities": entry["cities"],
+        })
+    return portfolio_daily
+
+
+def run_multi_city_backtest(cities: list[str], days: int = 180, coeffs=None) -> dict:
+    city_results = {}
+    skipped = {}
+
+    for requested_city in cities:
+        city = _canonical_city(requested_city)
+        if city in city_results:
+            continue
+        coords = CITY_COORDS.get(city)
+        if coords is None:
+            skipped[requested_city] = "unknown_city"
+            continue
+
+        lat, lon = coords
+        city_buckets = fetch_city_buckets_f(city)
+        city_results[city] = run_backtest(
+            city=city,
+            lat=lat,
+            lon=lon,
+            days=days,
+            coeffs=coeffs,
+            buckets_f=city_buckets,
+        )
+
+    if not city_results:
+        return {
+            "error": "no_valid_cities",
+            "requested_cities": cities,
+            "skipped_cities": skipped,
+        }
+
+    portfolio_daily = _build_portfolio_daily_records(city_results)
+    all_trades = []
+    diagnostics = {
+        "directional_rejects": {},
+        "arb_rejects": {},
+        "selection_rejects": {},
+        "candidate_counts": {},
+    }
+    for results in city_results.values():
+        all_trades.extend(results.get("all_trades", []))
+        for section, values in results.get("diagnostics", {}).items():
+            target = diagnostics.setdefault(section, {})
+            for key, value in values.items():
+                target[key] = target.get(key, 0) + value
+
+    total_pnl = round(sum(r.get("total_pnl", 0.0) for r in city_results.values()), 4)
+    total_risked = round(sum(r.get("total_risked", 0.0) for r in city_results.values()), 4)
+    wins = sum(1 for trade in all_trades if trade.get("outcome"))
+    brier_scores = [trade["brier"] for trade in all_trades if trade.get("brier") is not None]
+    active_cities = sum(1 for r in city_results.values() if r.get("n_bets", 0) > 0)
+    sample_result = next(iter(city_results.values()))
+    initial_bankroll = round(INITIAL_BANKROLL * len(city_results), 4)
+
+    return {
+        "mode": "multi_city",
+        "cities": list(city_results),
+        "city_results": city_results,
+        "skipped_cities": skipped,
+        "n_cities": len(city_results),
+        "cities_with_trades": active_cities,
+        "start_date": sample_result.get("start_date"),
+        "end_date": sample_result.get("end_date"),
+        "n_days": sample_result.get("n_days"),
+        "portfolio_daily_records": portfolio_daily,
+        "initial_bankroll": initial_bankroll,
+        "final_bankroll": round(initial_bankroll + total_pnl, 4),
+        "n_bets": len(all_trades),
+        "total_pnl": total_pnl,
+        "total_risked": total_risked,
+        "roi": round(total_pnl / initial_bankroll, 4) if initial_bankroll > 0 else 0.0,
+        "win_rate": round(wins / len(all_trades), 4) if all_trades else None,
+        "brier_score": round(statistics.mean(brier_scores), 6) if brier_scores else None,
+        "diagnostics": diagnostics,
+        "computed_at": date.today().isoformat(),
+    }
+
+
+def run_monte_carlo(
+    daily_records: list[dict],
+    starting_bankroll: float,
+    iterations: int = DEFAULT_MONTE_CARLO_ITERATIONS,
+    horizon_days: int | None = None,
+    seed: int = DEFAULT_MONTE_CARLO_SEED,
+) -> dict:
+    if not daily_records:
+        return {"error": "no_daily_records"}
+
+    pnl_samples = [float(row.get("day_pnl", 0.0)) for row in daily_records]
+    horizon = horizon_days or len(pnl_samples)
+    rng = random.Random(seed)
+
+    terminal_bankrolls = []
+    max_drawdowns = []
+    profitable = 0
+    half_or_worse = 0
+    busts = 0
+
+    for _ in range(iterations):
+        bankroll = float(starting_bankroll)
+        peak = bankroll
+        max_dd = 0.0
+
+        for _day in range(horizon):
+            bankroll = max(0.01, bankroll + rng.choice(pnl_samples))
+            peak = max(peak, bankroll)
+            if peak > 0:
+                max_dd = max(max_dd, (peak - bankroll) / peak)
+
+        terminal_bankrolls.append(bankroll)
+        max_drawdowns.append(max_dd)
+        profitable += 1 if bankroll > starting_bankroll else 0
+        half_or_worse += 1 if bankroll <= starting_bankroll * 0.5 else 0
+        busts += 1 if bankroll <= 0.05 else 0
+
+    return {
+        "iterations": iterations,
+        "seed": seed,
+        "sample_days": len(pnl_samples),
+        "horizon_days": horizon,
+        "starting_bankroll": round(starting_bankroll, 4),
+        "mean_daily_pnl": round(statistics.mean(pnl_samples), 6),
+        "stdev_daily_pnl": round(statistics.stdev(pnl_samples), 6) if len(pnl_samples) > 1 else 0.0,
+        "mean_terminal_bankroll": round(statistics.mean(terminal_bankrolls), 4),
+        "median_terminal_bankroll": _quantile(terminal_bankrolls, 0.5),
+        "p05_terminal_bankroll": _quantile(terminal_bankrolls, 0.05),
+        "p25_terminal_bankroll": _quantile(terminal_bankrolls, 0.25),
+        "p75_terminal_bankroll": _quantile(terminal_bankrolls, 0.75),
+        "p95_terminal_bankroll": _quantile(terminal_bankrolls, 0.95),
+        "best_terminal_bankroll": round(max(terminal_bankrolls), 4),
+        "worst_terminal_bankroll": round(min(terminal_bankrolls), 4),
+        "prob_profit": round(profitable / iterations, 4),
+        "prob_loss": round(1 - (profitable / iterations), 4),
+        "prob_half_bankroll_or_worse": round(half_or_worse / iterations, 4),
+        "prob_bust": round(busts / iterations, 4),
+        "mean_max_drawdown": round(statistics.mean(max_drawdowns), 4),
+        "p95_max_drawdown": _quantile(max_drawdowns, 0.95),
+    }
+
+
+def print_multi_city_backtest_report(results: dict) -> None:
+    print("\n" + "=" * 70, flush=True)
+    print("POLYMARKET WEATHER  —  MULTI-CITY BACKTEST", flush=True)
+    print("=" * 70, flush=True)
+
+    if results.get("error") == "no_valid_cities":
+        print("  ERROR: no valid cities were provided.", flush=True)
+        return
+
+    print(f"  Cities:         {results.get('n_cities', 0)} total / {results.get('cities_with_trades', 0)} with trades", flush=True)
+    print(f"  Period:         {results.get('start_date')} → {results.get('end_date')}", flush=True)
+    print(f"  Trading days:   {results.get('n_days', 0)}", flush=True)
+    print(f"  Total bets:     {results.get('n_bets', 0)}", flush=True)
+    print(f"  Initial roll:   ${results.get('initial_bankroll', 0.0):.2f}", flush=True)
+    print(f"  Final roll:     ${results.get('final_bankroll', 0.0):.2f}", flush=True)
+    print(f"  Total PnL:      ${results.get('total_pnl', 0.0):+.4f}", flush=True)
+    print(f"  ROI:            {results.get('roi', 0.0):+.1%}", flush=True)
+    win_rate = results.get("win_rate")
+    brier = results.get("brier_score")
+    print(f"  Win rate:       {win_rate:.1%}" if win_rate is not None else "  Win rate:       N/A", flush=True)
+    print(f"  Brier score:    {brier:.4f}" if brier is not None else "  Brier score:    N/A", flush=True)
+
+    skipped = results.get("skipped_cities", {})
+    if skipped:
+        print(f"  Skipped:        {', '.join(f'{city} ({reason})' for city, reason in skipped.items())}", flush=True)
+
+    ranked = sorted(
+        results.get("city_results", {}).items(),
+        key=lambda item: (-item[1].get("n_bets", 0), item[0]),
+    )
+    active_rows = [(city, stats) for city, stats in ranked if stats.get("n_bets", 0) > 0]
+    if active_rows:
+        print(flush=True)
+        print("  PER-CITY SUMMARY (cities with trades):", flush=True)
+        print(f"  {'City':>15s}  {'Bets':>5s}  {'PnL':>8s}  {'ROI':>8s}  {'WinRate':>8s}", flush=True)
+        print("  " + "-" * 60, flush=True)
+        for city, stats in active_rows[:20]:
+            wr = stats.get("win_rate")
+            wr_str = f"{wr:.1%}" if wr is not None else "N/A"
+            print(
+                f"  {city.title():>15s}  {stats.get('n_bets', 0):>5d}  "
+                f"${stats.get('total_pnl', 0.0):>+7.4f}  {stats.get('roi', 0.0):>+7.1%}  {wr_str:>8s}",
+                flush=True,
+            )
+        if len(active_rows) > 20:
+            print(f"  ... {len(active_rows) - 20} more cities omitted", flush=True)
+    else:
+        print("  No cities produced trades under current thresholds.", flush=True)
+
+
+def print_monte_carlo_report(results: dict) -> None:
+    print("\n" + "=" * 70, flush=True)
+    print("MONTE CARLO PORTFOLIO SIMULATION", flush=True)
+    print("=" * 70, flush=True)
+
+    if results.get("error") == "no_daily_records":
+        print("  ERROR: no daily records available for Monte Carlo simulation.", flush=True)
+        return
+
+    print(f"  Iterations:          {results.get('iterations', 0)}", flush=True)
+    print(f"  Horizon:             {results.get('horizon_days', 0)} days", flush=True)
+    print(f"  Sample days:         {results.get('sample_days', 0)}", flush=True)
+    print(f"  Starting bankroll:   ${results.get('starting_bankroll', 0.0):.2f}", flush=True)
+    print(f"  Mean daily PnL:      ${results.get('mean_daily_pnl', 0.0):+.4f}", flush=True)
+    print(f"  Daily PnL stdev:     ${results.get('stdev_daily_pnl', 0.0):.4f}", flush=True)
+    print(flush=True)
+    print("  TERMINAL BANKROLL DISTRIBUTION:", flush=True)
+    print(f"    Mean:              ${results.get('mean_terminal_bankroll', 0.0):.4f}", flush=True)
+    print(f"    Median:            ${results.get('median_terminal_bankroll', 0.0):.4f}", flush=True)
+    print(f"    P05 / P95:         ${results.get('p05_terminal_bankroll', 0.0):.4f} / ${results.get('p95_terminal_bankroll', 0.0):.4f}", flush=True)
+    print(f"    Worst / Best:      ${results.get('worst_terminal_bankroll', 0.0):.4f} / ${results.get('best_terminal_bankroll', 0.0):.4f}", flush=True)
+    print(flush=True)
+    print("  RISK METRICS:", flush=True)
+    print(f"    Prob. profit:      {results.get('prob_profit', 0.0):.1%}", flush=True)
+    print(f"    Prob. loss:        {results.get('prob_loss', 0.0):.1%}", flush=True)
+    print(f"    Prob. ≤50% roll:   {results.get('prob_half_bankroll_or_worse', 0.0):.1%}", flush=True)
+    print(f"    Prob. bust:        {results.get('prob_bust', 0.0):.1%}", flush=True)
+    print(f"    Mean max DD:       {results.get('mean_max_drawdown', 0.0):.1%}", flush=True)
+    print(f"    P95 max DD:        {results.get('p95_max_drawdown', 0.0):.1%}", flush=True)
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Backtest Polymarket weather strategies and run Monte Carlo simulations.")
+    parser.add_argument("--city", default="hong kong", help="single city to backtest")
+    parser.add_argument("--cities", default="", help="comma-separated city list for a portfolio backtest")
+    parser.add_argument("--all-cities", action="store_true", help="backtest every city with EMOS coefficients")
+    parser.add_argument("--days", type=int, default=180, help="historical lookback window")
+    parser.add_argument("--monte-carlo", action="store_true", help="run bootstrap Monte Carlo on the resulting daily PnL stream")
+    parser.add_argument("--mc-iterations", type=int, default=DEFAULT_MONTE_CARLO_ITERATIONS, help="number of Monte Carlo paths")
+    parser.add_argument("--mc-horizon-days", type=int, default=0, help="simulation horizon in days; 0 uses the sample length")
+    parser.add_argument("--seed", type=int, default=DEFAULT_MONTE_CARLO_SEED, help="RNG seed for Monte Carlo")
+    return parser.parse_args()
+
+
+def _resolve_requested_cities(args, coeffs) -> list[str]:
+    requested = []
+    if args.all_cities:
+        requested.extend(sorted(coeffs))
+    elif args.cities:
+        requested.extend(part.strip() for part in args.cities.split(",") if part.strip())
+    elif args.city:
+        requested.append(args.city)
+
+    if not requested:
+        requested = ["hong kong"]
+
+    resolved = []
+    seen = set()
+    for city in requested:
+        canonical = _canonical_city(city)
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        resolved.append(canonical)
+    return resolved
 
 
 # ─── 4. PRINT BACKTEST REPORT ─────────────────────────────
@@ -1060,23 +1498,58 @@ def print_backtest_report(results: dict) -> None:
 
 def main():
     import polymarket_emos as emos_mod
+
+    args = _parse_args()
     coeffs = emos_mod.load_coefficients()
+    requested_cities = _resolve_requested_cities(args, coeffs)
 
-    results = run_backtest(
-        city="hong kong",
-        lat=22.3020,
-        lon=114.1739,
-        days=180,
-        coeffs=coeffs,
-    )
+    run_portfolio = args.all_cities or len(requested_cities) > 1
+    if run_portfolio:
+        results = run_multi_city_backtest(
+            cities=requested_cities,
+            days=args.days,
+            coeffs=coeffs,
+        )
+        print_multi_city_backtest_report(results)
+        daily_records = results.get("portfolio_daily_records", [])
+        starting_bankroll = results.get("initial_bankroll", INITIAL_BANKROLL)
+    else:
+        city = requested_cities[0]
+        coords = CITY_COORDS.get(city)
+        if coords is None:
+            raise SystemExit(f"Unknown city: {city}")
+        lat, lon = coords
+        results = run_backtest(
+            city=city,
+            lat=lat,
+            lon=lon,
+            days=args.days,
+            coeffs=coeffs,
+        )
+        print_backtest_report(results)
+        daily_records = results.get("daily_records", [])
+        starting_bankroll = results.get("initial_bankroll", INITIAL_BANKROLL)
 
-    print_backtest_report(results)
+    monte_carlo = None
+    if args.monte_carlo:
+        monte_carlo = run_monte_carlo(
+            daily_records=daily_records,
+            starting_bankroll=starting_bankroll,
+            iterations=max(1, args.mc_iterations),
+            horizon_days=args.mc_horizon_days or None,
+            seed=args.seed,
+        )
+        print_monte_carlo_report(monte_carlo)
 
-    # Save results (without the full trade list to keep file small)
     out_path = os.path.join(_SCRIPT_DIR, "backtest_results.json")
-    results_slim = {k: v for k, v in results.items() if k != "all_trades"}
+    payload = {
+        "args": vars(args),
+        "results": _slim_backtest_results(results),
+    }
+    if monte_carlo is not None:
+        payload["monte_carlo"] = monte_carlo
     with open(out_path, "w") as f:
-        json.dump(results_slim, f, indent=2)
+        json.dump(payload, f, indent=2)
     print(f"\n[backtest] Results saved → {out_path}", flush=True)
 
 
