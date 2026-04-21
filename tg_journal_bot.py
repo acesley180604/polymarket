@@ -264,14 +264,14 @@ def edit(cid, mid, text, kb=None):
 def make_kb(with_webapp=True):
     url = get_tunnel_url()
     rows = [
-        [{"text":"📊 Dashboard","callback_data":"dashboard"},
-         {"text":"📂 Positions","callback_data":"positions"}],
-        [{"text":"📈 Stats",    "callback_data":"stats"},
-         {"text":"⚙️ System",  "callback_data":"system"}],
+        [{"text":" Dashboard","callback_data":"dashboard"},
+         {"text":" Positions","callback_data":"positions"}],
+        [{"text":" Stats",    "callback_data":"stats"},
+         {"text":" System",  "callback_data":"system"}],
     ]
     if url and with_webapp:
-        rows.insert(0, [{"text":"🚀 Open Dashboard", "web_app": {"url": url}}])
-    rows.append([{"text":"🔄 Refresh","callback_data":"dashboard"}])
+        rows.insert(0, [{"text":" Open Dashboard", "web_app": {"url": url}}])
+    rows.append([{"text":" Refresh","callback_data":"dashboard"}])
     return {"inline_keyboard": rows}
 
 def fmt_dashboard():
@@ -280,18 +280,18 @@ def fmt_dashboard():
     perf = d["performance"]
     wr = f"{perf['win_rate']*100:.1f}%" if perf["win_rate"] else "TBD"
     return "\n".join([
-        "📊 *POLYMARKET DASHBOARD*",
-        f"🕐 _{datetime.now(timezone.utc).strftime('%b %d %H:%M UTC')}_  |  Day {d['days_running']}",
+        " *POLYMARKET DASHBOARD*",
+        f" _{datetime.now(timezone.utc).strftime('%b %d %H:%M UTC')}_  |  Day {d['days_running']}",
         "",
         "━━ BOOK ━━",
-        f"💵 Cash:      *${p['cash']:.2f}*",
-        f"📂 Deployed:  *${p['deployed']:.2f}*",
-        f"📈 Pending EV: *${p['pending_ev']:.2f}*",
-        f"✅ Resolved:  *{perf['resolved']}*",
+        f" Cash:      *${p['cash']:.2f}*",
+        f" Deployed:  *${p['deployed']:.2f}*",
+        f" Pending EV: *${p['pending_ev']:.2f}*",
+        f" Resolved:  *{perf['resolved']}*",
         "",
         "━━ ARB PERFORMANCE ━━",
-        f"🎯 Win rate: *{wr}*  |  Fill: *{perf['fill_rate']*100:.0f}%*",
-        f"📐 Avg dev: *{perf['avg_dev']:.3f}*  |  Trades: *{perf['arb_total']}*",
+        f" Win rate: *{wr}*  |  Fill: *{perf['fill_rate']*100:.0f}%*",
+        f" Avg dev: *{perf['avg_dev']:.3f}*  |  Trades: *{perf['arb_total']}*",
         "",
         f"$500 gate: *{perf['resolved']}/30* resolved",
     ])
@@ -303,7 +303,7 @@ def fmt_positions():
     for t in open_t:
         d = t.get("end_date","?")
         by_date.setdefault(d,[]).append(t)
-    lines = [f"📂 *OPEN POSITIONS* ({len(open_t)} total)", ""]
+    lines = [f" *OPEN POSITIONS* ({len(open_t)} total)", ""]
     for d in sorted(by_date):
         pos = by_date[d]
         bet = sum(float(x.get("bet",0)) for x in pos)
@@ -312,7 +312,7 @@ def fmt_positions():
             c = t.get("city","?").title()
             cities[c] = cities.get(c,0)+1
         cs = " ".join(f"{c}×{n}" for c,n in sorted(cities.items()))
-        lines += [f"📅 *{d}* — {len(pos)} trades  ${bet:.2f}", f"   {cs}"]
+        lines += [f" *{d}* — {len(pos)} trades  ${bet:.2f}", f"   {cs}"]
     return "\n".join(lines)
 
 def fmt_stats():
@@ -324,7 +324,7 @@ def fmt_stats():
         arms.setdefault(a,{"n":0,"bet":0.0})
         arms[a]["n"]   += 1
         arms[a]["bet"] += float(t.get("bet",0))
-    lines = [f"📈 *STATS*  ({len(arb)} arb trades)", ""]
+    lines = [f" *STATS*  ({len(arb)} arb trades)", ""]
     for a, d in sorted(arms.items(), key=lambda x:-x[1]["n"]):
         lines.append(f"  *{a[:30]}*: {d['n']} trades  ${d['bet']:.2f}")
     return "\n".join(lines)
@@ -332,18 +332,18 @@ def fmt_stats():
 def fmt_system():
     d = build_data()["system"]
     def icon(age, warn=120, crit=480):
-        if age < 0:    return "❓"
-        if age < warn: return "✅"
-        if age < crit: return "⚠️"
-        return "❌"
+        if age < 0:    return ""
+        if age < warn: return ""
+        if age < crit: return ""
+        return ""
     lines = [
-        "⚙️ *SYSTEM*", "",
-        f"{'✅' if d['scanner_active'] else '❌'} Scanner service  _{d['scanner_age_min']:.0f}m ago_",
+        " *SYSTEM*", "",
+        f"{'' if d['scanner_active'] else ''} Scanner service  _{d['scanner_age_min']:.0f}m ago_",
         f"{icon(d['autosell_age_min'],10,30)} Autosell  _{d['autosell_age_min']}m ago_",
         f"{icon(d['truth_age_min'],130,300)} Truth resolve  _{d['truth_age_min']}m ago_",
         f"{icon(d['daily_check_age_min'],1500,1600)} Daily check  _{d['daily_check_age_min']}m ago_",
         "",
-        f"💾 Disk: *{d['disk_pct']}%*  |  RAM: *{d['mem_pct']}%*",
+        f" Disk: *{d['disk_pct']}%*  |  RAM: *{d['mem_pct']}%*",
     ]
     return "\n".join(lines)
 
@@ -376,7 +376,7 @@ def handle_cb(cb):
     edit(cid, mid, fn(), make_kb())
 
 def poll_loop():
-    print("🤖 Polymarket Journal Bot started")
+    print(" Polymarket Journal Bot started")
     offset = 0
     while True:
         try:
@@ -395,5 +395,5 @@ def poll_loop():
 if __name__ == "__main__":
     t = threading.Thread(target=poll_loop, daemon=True)
     t.start()
-    print(f"🌐 Flask server on :{SERVER_PORT}")
+    print(f" Flask server on :{SERVER_PORT}")
     app.run(host="0.0.0.0", port=SERVER_PORT, debug=False, use_reloader=False)

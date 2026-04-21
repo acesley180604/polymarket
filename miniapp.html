@@ -118,26 +118,26 @@
 
 <div class="header">
   <div class="header-row">
-    <h1>⚡ Polymarket</h1>
+    <h1> Polymarket</h1>
     <span class="freshness fresh-live" id="freshness">Loading…</span>
   </div>
 </div>
 
 <div class="tabs">
   <div class="tab active" onclick="switchTab('portfolio')" id="tab-portfolio">
-    <span class="icon">💼</span><span>Portfolio</span>
+    <span class="icon"></span><span>Portfolio</span>
   </div>
   <div class="tab" onclick="switchTab('scanner')" id="tab-scanner">
-    <span class="icon">📡</span><span>Scanner</span>
+    <span class="icon"></span><span>Scanner</span>
   </div>
   <div class="tab" onclick="switchTab('trades')" id="tab-trades">
-    <span class="icon">📋</span><span>Trades</span>
+    <span class="icon"></span><span>Trades</span>
   </div>
   <div class="tab" onclick="switchTab('gate')" id="tab-gate">
-    <span class="icon">🏆</span><span>Gate</span>
+    <span class="icon"></span><span>Gate</span>
   </div>
   <div class="tab" onclick="switchTab('system')" id="tab-system">
-    <span class="icon">⚙️</span><span>System</span>
+    <span class="icon"></span><span>System</span>
   </div>
 </div>
 
@@ -312,7 +312,7 @@ function renderScanner(d) {
       <div class="card-grid">
         <div class="card ${s.active ? 'green' : 'red'}">
           <div class="label">Service</div>
-          <div class="value" style="font-size:18px;color:var(--${s.active?'green':'red'})">${s.active ? '✅ Active' : '❌ Down'}</div>
+          <div class="value" style="font-size:18px;color:var(--${s.active?'green':'red'})">${s.active ? ' Active' : ' Down'}</div>
           <div class="sub">polymarket-scanner</div>
         </div>
         <div class="card ${ageOk ? 'green' : ageWarn ? 'yellow' : 'red'}">
@@ -410,7 +410,7 @@ function renderGate(d) {
     const checkHtml = checks.map(function(c) {
       const ok  = c.val !== null && c.val >= c.target;
       const tbd = c.val === null;
-      const icon = tbd ? '⏳' : ok ? '✅' : '❌';
+      const icon = tbd ? '' : ok ? '' : '';
       const valStr = tbd ? 'TBD' : c.fmt(c.val);
       return `<div class="row">
         <div><div class="name">${icon} ${c.label}</div></div>
@@ -422,7 +422,7 @@ function renderGate(d) {
       <div class="section">
         <div class="section-title">${title} — Deposit ${amount}</div>
         <div class="card ${allPass ? 'green' : ''}">
-          ${allPass ? '<div style="color:var(--green);font-weight:700;margin-bottom:8px;font-size:15px">🎉 GATE PASSED — Ready to deposit!</div>' : ''}
+          ${allPass ? '<div style="color:var(--green);font-weight:700;margin-bottom:8px;font-size:15px"> GATE PASSED — Ready to deposit!</div>' : ''}
           ${checkHtml}
           <div style="margin-top:10px">
             <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-bottom:4px">
