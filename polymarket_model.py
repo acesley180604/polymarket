@@ -324,24 +324,26 @@ def fetch_usdc_balance():
     if not address:
         return float(override or 0), 0.0
 
-    # Try: Polygon on-chain USDC balance (6 decimals)
-    USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-    usdc_cash = None  # None=RPC failed, 0.0=genuine zero
-    for rpc in ["https://polygon-rpc.com", "https://rpc.ankr.com/polygon"]:
-        try:
-            payload = {
-                "jsonrpc": "2.0", "method": "eth_call",
-                "params": [{"to": USDC_CONTRACT,
-                             "data": "0x70a08231000000000000000000000000" + address[2:]},
-                            "latest"],
-                "id": 1,
-            }
-            r = requests.post(rpc, json=payload, timeout=8)
-            result = r.json().get("result", "0x0")
-            usdc_cash = int(result, 16) / 1e6
-            break
-        except Exception:
-            pass
+    # Fetch USDC collateral balance via py_clob_client /balance-allowance (COLLATERAL)
+    usdc_cash = None
+    try:
+        from py_clob_client.client import ClobClient
+        from py_clob_client.constants import POLYGON
+        from py_clob_client.clob_types import ApiCreds, BalanceAllowanceParams, AssetType
+        _c = ClobClient(
+            host="https://clob.polymarket.com", chain_id=POLYGON,
+            key=_env.get("POLY_PRIVATE_KEY",""), signature_type=1, funder=address,
+            creds=ApiCreds(
+                api_key=_env.get("POLY_API_KEY",""),
+                api_secret=_env.get("POLY_SECRET",""),
+                api_passphrase=_env.get("POLY_PASSPHRASE",""),
+            ),
+        )
+        resp = _c.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+        usdc_cash = int(resp.get("balance","0")) / 1e6
+        print(f"    (CLOB balance:  USDC)", flush=True)
+    except Exception as _e:
+        print(f"    (CLOB balance failed: {_e})", flush=True)
 
     # Try 2: data-api portfolio
     portfolio_val = 0.0
