@@ -227,7 +227,8 @@ def get_data_cached():
 # ── Flask routes ──────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    resp = send_file(MINIAPP_HTML, mimetype="text/html")
+    content = open(MINIAPP_HTML).read()
+    resp = app.response_class(response=content, mimetype="text/html")
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"]        = "no-cache"
     return resp
@@ -264,14 +265,14 @@ def edit(cid, mid, text, kb=None):
 def make_kb(with_webapp=True):
     url = get_tunnel_url()
     rows = [
-        [{"text":" Dashboard","callback_data":"dashboard"},
-         {"text":" Positions","callback_data":"positions"}],
-        [{"text":" Stats",    "callback_data":"stats"},
-         {"text":" System",  "callback_data":"system"}],
+        [{"text":"Dashboard","callback_data":"dashboard"},
+         {"text":"Positions","callback_data":"positions"}],
+        [{"text":"Stats",    "callback_data":"stats"},
+         {"text":"System",  "callback_data":"system"}],
     ]
     if url and with_webapp:
-        rows.insert(0, [{"text":" Open Dashboard", "web_app": {"url": url}}])
-    rows.append([{"text":" Refresh","callback_data":"dashboard"}])
+        rows.insert(0, [{"text":"Open Dashboard", "web_app": {"url": url}}])
+    rows.append([{"text":"Refresh","callback_data":"dashboard"}])
     return {"inline_keyboard": rows}
 
 def fmt_dashboard():
